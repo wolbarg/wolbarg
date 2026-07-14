@@ -1,0 +1,25 @@
+{
+  "name": "agentorc-benchmark",
+  "version": "1.0.0",
+  "private": true,
+  "description": "Complete Agent ORC SDK benchmarking suite (Tinybench)",
+  "type": "module",
+  "scripts": {
+    "benchmark": "tsx benchmark.ts",
+    "benchmark:quick": "tsx benchmark.ts --quick",
+    "benchmark:live": "tsx benchmark.ts --live"
+  },
+  "dependencies": {
+    "agentorc": "^0.1.0"
+  },
+  "devDependencies": {
+    "@types/node": "^22.15.21",
+    "dotenv": "^17.4.2",
+    "tinybench": "^6.0.2",
+    "tsx": "^4.19.4",
+    "typescript": "^5.8.3"
+  },
+  "engines": {
+    "node": ">=22.5.0"
+  }
+}

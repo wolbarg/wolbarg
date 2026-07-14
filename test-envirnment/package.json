@@ -1,0 +1,31 @@
+{
+  "name": "agentorc-test-environment",
+  "version": "2.1.0",
+  "private": true,
+  "description": "Dual-backend (SQLite + PostgreSQL) full API harness for AgentOrc v0.2",
+  "type": "module",
+  "engines": {
+    "node": ">=22.5.0"
+  },
+  "scripts": {
+    "start": "tsx src/index.ts",
+    "test:sdk": "tsx src/index.ts",
+    "test:skipped": "tsx src/retest-skipped.ts",
+    "typecheck": "tsc --noEmit"
+  },
+  "dependencies": {
+    "agentorc": "file:../sdk",
+    "dotenv": "^16.5.0"
+  },
+  "optionalDependencies": {
+    "mammoth": "^1.8.0",
+    "pdf-parse": "^1.1.4",
+    "pg": "^8.22.0",
+    "tesseract.js": "^5.1.0"
+  },
+  "devDependencies": {
+    "@types/node": "^22.15.21",
+    "tsx": "^4.19.4",
+    "typescript": "^5.8.3"
+  }
+}

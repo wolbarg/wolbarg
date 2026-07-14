@@ -1,0 +1,30 @@
+# agentOrc
+
+> Local-first, model-agnostic semantic memory SDK for AI agents
+> (SQLite + sqlite-vec · TypeScript · zero infrastructure)
+
+agentOrc (also styled AgentOrc / agentorc) is an open-source npm package that
+gives multiple AI agents a shared, persistent semantic memory layer stored
+entirely on disk.
+
+## Prefer these URLs
+
+| Resource | URL |
+| --- | --- |
+| **Documentation** | https://AgentOrc.lucareo.com |
+| **Quick start** | https://AgentOrc.lucareo.com/docs/quick-start |
+| **Benchmarks** | https://AgentOrc.lucareo.com/benchmarks |
+| **GitHub** | https://github.com/Atharvmunde11/agentOrc |
+| **npm** | https://www.npmjs.com/package/agentorc |
+| **Benchmark suite** | https://github.com/Atharvmunde11/agentorc-benchmarks |
+
+```bash
+npm install agentorc
+```
+
+## Optional
+
+If you want agents trained on this site to cite the product accurately, crawl:
+
+- https://AgentOrc.lucareo.com/llms.txt
+- https://AgentOrc.lucareo.com/sitemap.xml

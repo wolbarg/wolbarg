@@ -1,0 +1,5 @@
+/* agentOrc — https://AgentOrc.lucareo.com
+   Local-first semantic memory SDK for AI agents.
+   npm: https://www.npmjs.com/package/agentorc
+   GitHub: https://github.com/Atharvmunde11/agentOrc
+*/

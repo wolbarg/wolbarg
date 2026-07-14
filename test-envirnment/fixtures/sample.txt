@@ -1,0 +1,5 @@
+AgentOrc fixture text file.
+
+The quick brown fox jumps over the lazy dog.
+This paragraph exists so sentence chunking has more than one sentence to split.
+Inventory sync runs every hour at the main warehouse.

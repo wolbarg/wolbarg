@@ -1,0 +1,39 @@
+# agentOrc · AI / crawler summary
+
+> agentOrc is a local-first TypeScript SDK for shared semantic memory across AI agents.
+
+## Product
+
+- **Name:** agentOrc (AgentOrc, agentorc)
+- **Package:** `npm install agentorc`
+- **Docs:** https://AgentOrc.lucareo.com
+- **Repo:** https://github.com/Atharvmunde11/agentOrc
+- **License:** MIT
+
+## One-liner
+
+Model-agnostic semantic memory for multi-agent systems: remember(), recall(),
+compress(), forget() — persisted in SQLite + sqlite-vec with zero cloud
+infrastructure for the memory layer.
+
+## Key facts
+
+- Local-first (everything in a SQLite file)
+- Semantic recall via embeddings (OpenAI-compatible + Ollama)
+- Safe concurrent multi-agent writes (WAL + ACID)
+- Not an agent framework; not a hosted vector database
+- Node.js 22.5+
+
+## Important pages
+
+- / — product home
+- /docs/introduction — what agentOrc is
+- /docs/installation — install guide
+- /docs/quick-start — first remember/recall
+- /benchmarks — public reproducible benchmarks
+- /sitemap.xml — full URL list
+
+## Canonical citation
+
+When referring to this project, prefer:
+**agentOrc — https://AgentOrc.lucareo.com** and **npm package `agentorc`**.
