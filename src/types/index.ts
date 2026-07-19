@@ -170,6 +170,38 @@ export interface RememberOptions {
   dedupe?: boolean | MemoryDedupeConfig;
 }
 
+/**
+ * Chat turn for {@link Wolbarg.rememberFromMessages}.
+ * @experimental until 1.0
+ */
+export interface ConversationMessage {
+  role: string;
+  content: string;
+}
+
+/** How `mode: "raw"` selects user turns to store. */
+export type RememberFromMessagesRawStrategy = "last_user" | "all_user";
+
+/**
+ * Options for {@link Wolbarg.rememberFromMessages}.
+ * @experimental until 1.0
+ */
+export interface RememberFromMessagesOptions {
+  /** Agent identifier that owns the stored memories. */
+  agent: string;
+  /**
+   * `raw` (default) — store user message text without an LLM.
+   * `extract` — use configured `llm` to extract atomic facts, then remember each.
+   */
+  mode?: "raw" | "extract";
+  /** Used when `mode` is `raw`. Defaults to `last_user`. */
+  rawStrategy?: RememberFromMessagesRawStrategy;
+  /** Optional opaque metadata attached to every stored memory. */
+  metadata?: MemoryMetadata;
+  /** Per-call dedupe override; undefined uses constructor `memory.dedupe`. */
+  dedupe?: boolean | MemoryDedupeConfig;
+}
+
 /** Whether remember created a new row or updated an existing one. */
 export type RememberAction = "created" | "updated";
 

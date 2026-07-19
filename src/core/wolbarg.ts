@@ -116,9 +116,18 @@ import type {
   RecallResult,
   RememberOptions,
   RememberResult,
+  ConversationMessage,
+  RememberFromMessagesOptions,
   RetrievalConfig,
   StatsResult,
 } from "../types/index.js";
+import {
+  normalizeConversationMessages,
+  resolveRememberFromMessagesOptions,
+  selectRawUserTexts,
+  buildExtractMessages,
+  parseExtractedFacts,
+} from "../memory/from-messages.js";
 import type { GraphProvider, GetRelatedOptions } from "../graph/types.js";
 import {
   AsyncMutex,
@@ -574,6 +583,90 @@ export class Wolbarg<HasLlm extends boolean = false> {
     } catch (error) {
       parent.failure(error);
       throw wrapOperationError("rememberBatch", error);
+    }
+  }
+
+  /**
+   * Store memories from a chat transcript.
+   *
+   * **Experimental** until 1.0 — API shape may change.
+   *
+   * - `mode: "raw"` (default) — remember user message text (no LLM).
+   * - `mode: "extract"` — require configured `llm`; extract atomic facts then remember each.
+   */
+  async rememberFromMessages(
+    messages: ConversationMessage[],
+    options: RememberFromMessagesOptions,
+  ): Promise<RememberResult[]> {
+    const parent = this.telemetry.start("rememberFromMessages");
+    try {
+      const normalized = normalizeConversationMessages(messages);
+      const resolved = resolveRememberFromMessagesOptions(options);
+
+      let texts: string[];
+      if (resolved.mode === "extract") {
+        if (!this.llm) {
+          throw new ProviderNotConfiguredError(
+            "llm",
+            "rememberFromMessages",
+            'pass llm: openaiLlm(...) in the constructor when mode is "extract"',
+          );
+        }
+        const llmOutput = await this.llm.complete(
+          buildExtractMessages(normalized),
+        );
+        texts = parseExtractedFacts(llmOutput);
+        if (texts.length === 0) {
+          parent.success({
+            returnedCount: 0,
+            agentId: resolved.agent,
+            extra: { mode: "extract", factCount: 0 },
+          });
+          return [];
+        }
+      } else {
+        texts = selectRawUserTexts(normalized, resolved.rawStrategy);
+      }
+
+      const out: RememberResult[] = [];
+      for (const text of texts) {
+        const child = parent.child("remember");
+        const result = await this.rememberOne(
+          {
+            agent: resolved.agent,
+            content: { text },
+            ...(resolved.metadata !== undefined
+              ? { metadata: resolved.metadata }
+              : {}),
+            ...(resolved.dedupe !== undefined ? { dedupe: resolved.dedupe } : {}),
+          },
+          child,
+        );
+        child.success({
+          provider: this.storage?.name,
+          memoryIds: [result.id],
+          returnedCount: 1,
+          metadata: result.metadata,
+          agentId: result.agent,
+          tags: telemetryTags(result.metadata),
+          extra: { upsertAction: result.action, mode: resolved.mode },
+        });
+        out.push(result);
+      }
+
+      parent.success({
+        provider: this.storage?.name,
+        memoryIds: out.map((r) => r.id),
+        returnedCount: out.length,
+        embeddingProvider: this.embedding?.model,
+        model: this.embedding?.model,
+        agentId: resolved.agent,
+        extra: { mode: resolved.mode },
+      });
+      return out;
+    } catch (error) {
+      parent.failure(error, { agentId: options?.agent });
+      throw wrapOperationError("rememberFromMessages", error);
     }
   }
 

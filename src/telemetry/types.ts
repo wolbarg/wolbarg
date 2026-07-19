@@ -27,7 +27,8 @@ export type TelemetryOperation =
   | "getCheckpoint"
   | "linkMemories"
   | "getRelated"
-  | "graphQuery";
+  | "graphQuery"
+  | "rememberFromMessages";
 
 export type TelemetryStatus = "ok" | "error" | "cancelled";
 
