@@ -1,7 +1,8 @@
 /**
- * Wolbarg — local-first, model-agnostic semantic memory SDK for AI agents (v0.5.5).
+ * Wolbarg — local-first, model-agnostic semantic memory SDK for AI agents (v0.5.6).
  *
- * Construct with {@link wolbarg} / {@link Wolbarg}. Pass custom provider instances
+ * Construct with {@link wolbarg} / {@link Wolbarg}, or run `wolbarg init` and
+ * {@link createWolbargFromProjectConfig}. Pass custom provider instances
  * or factory helpers for embedding (`openaiEmbedding`, custom {@link EmbeddingProvider}),
  * LLM (`openaiLlm`, custom {@link LlmProvider}), storage, graph, and plugins.
  *
@@ -230,3 +231,33 @@ export { TelemetryEmitter, NoopTelemetryProvider, WolbargLogger } from "./teleme
 
 export type { BenchmarkSample, BenchmarkReport } from "./benchmark/index.js";
 export { runBenchmark, summarizeBenchmark } from "./benchmark/index.js";
+
+export {
+  EMBEDDING_PROVIDER_PRESETS,
+  getEmbeddingProviderPreset,
+  DEFAULT_SQLITE_DB_PATH,
+  DEFAULT_ORGANIZATION,
+  DEFAULT_CONFIG_PATH,
+  DEFAULT_ENV_PATH,
+  defaultProjectConfig,
+  loadProjectConfig,
+  saveProjectConfig,
+  resolveConfigPath,
+  resolveEnvPath,
+  resolveEmbeddingApiKey,
+  upsertEnvVar,
+  assertEmbeddingPreset,
+  createWolbargFromProjectConfig,
+  projectConfigToWolbargOptions,
+  applyEnvFile,
+} from "./config/index.js";
+
+export type {
+  EmbeddingProviderId,
+  EmbeddingProviderPreset,
+  WolbargProjectConfig,
+  WolbargProjectDatabaseConfig,
+  WolbargProjectEmbeddingConfig,
+  SaveProjectConfigOptions,
+  CreateFromProjectConfigOptions,
+} from "./config/index.js";

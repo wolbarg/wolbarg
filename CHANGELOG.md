@@ -5,6 +5,20 @@ All notable changes to this project are documented here.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/).
 
+## [0.5.6] — 2026-07-24
+
+### Added
+
+- **`wolbarg` CLI** with `wolbarg init` — interactive (or `--yes`) project setup for database + embedding provider
+- Default SQLite path: `.wolbarg/shared-memory/memory.db`
+- Provider presets (OpenAI, Ollama, OpenRouter, LM Studio, Gemini, Together, vLLM, custom) with **visible default base URLs** the user can edit
+- Writes `.wolbarg/config.json` and optional `.wolbarg/.env` (API key); adds `.env` paths to `.gitignore`
+- **`createWolbargFromProjectConfig()`** / `loadProjectConfig()` to boot the SDK from init output
+
+### Compatibility
+
+- Additive. Existing programmatic `wolbarg({...})` usage unchanged.
+
 ## [0.5.5] — 2026-07-21
 
 ### Added

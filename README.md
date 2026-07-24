@@ -15,9 +15,39 @@
 npm install wolbarg
 ```
 
+### Configure with the CLI (recommended)
+
+```bash
+npx wolbarg init
+```
+
+You will be prompted (all optional — Enter accepts defaults):
+
+1. **Database** — default `.wolbarg/shared-memory/memory.db` (or a Postgres URL)
+2. **Embedding provider** — OpenAI, Ollama, OpenRouter, LM Studio, Gemini, Together, vLLM, or custom
+3. **Base URL** — always shown with that provider’s default (edit or keep)
+4. **Model** — provider default pre-filled
+5. **API key** — written to `.wolbarg/.env` (not into config JSON)
+
+Non-interactive:
+
+```bash
+npx wolbarg init --yes --provider openai --api-key "$OPENAI_API_KEY"
+npx wolbarg init --yes --skip-embedding
+```
+
+Then in code:
+
+```ts
+import { createWolbargFromProjectConfig } from "wolbarg";
+
+const ctx = createWolbargFromProjectConfig();
+await ctx.ready();
+```
+
 Wolbarg is **memory infrastructure**, not an agent framework. Agents call `remember()` / `recall()` (and optionally ingest, compress, subscribe, and link memories in a graph). You bring SQLite or PostgreSQL, any OpenAI-compatible embedding API, and optional peers for PDF/DOCX/OCR/Neo4j.
 
-**Current release: [v0.5.5](./CHANGELOG.md)** — comprehensive JSDoc for IDE hover docs across the SDK and adapters. Still includes official framework adapters (`@wolbarg/openai`, `@wolbarg/langchain`, `@wolbarg/llamaindex`, `@wolbarg/mastra`, `@wolbarg/vercel-ai`), experimental `rememberFromMessages()`, 0.5 graph memory (SQLite + Neo4j), `includeGraph` recall, and [Wolbarg Studio](https://wolbarg.com/docs/observability).
+**Current release: [v0.5.6](./CHANGELOG.md)** — `wolbarg init` CLI + project config loader. Still includes official framework adapters (`@wolbarg/openai`, `@wolbarg/langchain`, `@wolbarg/llamaindex`, `@wolbarg/mastra`, `@wolbarg/vercel-ai`), experimental `rememberFromMessages()`, 0.5 graph memory (SQLite + Neo4j), `includeGraph` recall, and [Wolbarg Studio](https://wolbarg.com/docs/observability).
 
 ---
 

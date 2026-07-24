@@ -15,6 +15,10 @@ const replacements = [
   [/require\(["']fs["']\)/g, 'require("node:fs")'],
   [/from ["']path["']/g, 'from "node:path"'],
   [/require\(["']path["']\)/g, 'require("node:path")'],
+  [/from ["']readline["']/g, 'from "node:readline"'],
+  [/require\(["']readline["']\)/g, 'require("node:readline")'],
+  [/from ["']readline\/promises["']/g, 'from "node:readline/promises"'],
+  [/require\(["']readline\/promises["']\)/g, 'require("node:readline/promises")'],
 ];
 
 for (const file of fs.readdirSync(distDir)) {
