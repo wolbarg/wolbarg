@@ -348,8 +348,9 @@ export interface MemoryRecord {
   /**
    * Optimistic concurrency token (`row_version`). Pass to
    * {@link Wolbarg.update} as `expectedVersion` to reject stale writers.
+   * SQL-backed records include this value. Synthetic graph records may omit it.
    */
-  version: number;
+  version?: number;
   createdAt: Date;
   updatedAt: Date;
 }
