@@ -1,9 +1,9 @@
 <p align="center">
-  <img src="./assets/wolbarg-icon.png" alt="Wolbarg" width="96" height="96" align="absmiddle" />
+  <img src="https://raw.githubusercontent.com/wolbarg/wolbarg/main/sdk/assets/wolbarg-icon.png" alt="Wolbarg" width="96" height="96" align="absmiddle" />
   &nbsp;&nbsp;&nbsp;
   <picture>
-    <source media="(prefers-color-scheme: dark)" srcset="./assets/wolbarg-name-dark.png" />
-    <img src="./assets/wolbarg-name-light.png" alt="wolbarg" height="46" align="absmiddle" />
+    <source media="(prefers-color-scheme: dark)" srcset="https://raw.githubusercontent.com/wolbarg/wolbarg/main/sdk/assets/wolbarg-name-dark.png" />
+    <img src="https://raw.githubusercontent.com/wolbarg/wolbarg/main/sdk/assets/wolbarg-name-light.png" alt="wolbarg" height="46" align="absmiddle" />
   </picture>
 </p>
 
