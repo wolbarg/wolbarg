@@ -345,6 +345,11 @@ export interface MemoryRecord {
   archived: boolean;
   /** ID of the summary memory this was compressed into, if any. */
   compressedInto: string | null;
+  /**
+   * Optimistic concurrency token (`row_version`). Pass to
+   * {@link Wolbarg.update} as `expectedVersion` to reject stale writers.
+   */
+  version: number;
   createdAt: Date;
   updatedAt: Date;
 }

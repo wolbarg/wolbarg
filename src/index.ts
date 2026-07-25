@@ -89,6 +89,7 @@ export {
   MemoryNotFoundError,
   ProviderNotConfiguredError,
   StorageLockedError,
+  VersionConflictError,
   ValidationError,
   wrapOperationError,
 } from "./errors/index.js";

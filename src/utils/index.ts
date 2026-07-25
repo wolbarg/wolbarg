@@ -150,3 +150,13 @@ export function joinUrl(baseUrl: string, path: string): string {
   const suffix = path.startsWith("/") ? path : `/${path}`;
   return `${base}${suffix}`;
 }
+
+export {
+  resolveBackoffConfig,
+  fullJitterDelay,
+  deadlineExceeded,
+  sleep,
+  parseRetryAfterMs,
+  type BackoffConfig,
+  type ResolvedBackoffConfig,
+} from "./backoff.js";

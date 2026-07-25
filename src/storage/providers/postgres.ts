@@ -8,14 +8,19 @@
  * - Single-statement CTE inserts (no BEGIN/COMMIT for one memory)
  * - Named prepared statements (parse/plan once per connection)
  * - Concurrent insert coalescing into unnest batches
- * - float4[] vector bind (no text "[f,f,…]" parse tax)
+ * - float4[] vector bind (no text "[f,f,ΓÇª]" parse tax)
  * - Org/agent/archived denormalized on embeddings for filtered ANN
  * - Large bulk inserts via sequential fat unnest (COPY-class amortization)
  * - JSONB metadata filter pushdown
  */
 
 import { AsyncLocalStorage } from "node:async_hooks";
-import { DatabaseError, InitializationError, ConfigurationError } from "../../errors/index.js";
+import {
+  DatabaseError,
+  InitializationError,
+  ConfigurationError,
+  VersionConflictError,
+} from "../../errors/index.js";
 import { matchesMetadata } from "../../filters/match.js";
 import { compileMetadataFilterToPostgres } from "../../filters/sql-compile-postgres.js";
 import { SCHEMA_VERSION, META_KEYS } from "../../schema/index.js";
@@ -74,26 +79,9 @@ export interface PostgresProviderOptions {
   durableWrites?: boolean;
 }
 
+const txStore = new AsyncLocalStorage<PgPoolClient>();
+
 const warnLogger = new WolbargLogger("warn");
-
-/** True for Postgres deadlock / serialization failures that are safe to retry. */
-function isRetriablePgTxError(error: unknown): boolean {
-  const code =
-    error && typeof error === "object" && "code" in error
-      ? String((error as { code?: unknown }).code ?? "")
-      : "";
-  if (code === "40P01" || code === "40001") {
-    return true;
-  }
-  const msg = error instanceof Error ? error.message : String(error);
-  return /deadlock detected|could not serialize access/i.test(msg);
-}
-
-function pgTxBackoffMs(attempt: number): number {
-  const base = 25 * 2 ** attempt;
-  const jitter = Math.random() * 25;
-  return Math.min(1000, base + jitter);
-}
 let warnedPgvectorFallback = false;
 let warnedFtsKeywordSearch = false;
 let warnedHnswSoftFail = false;
@@ -118,7 +106,7 @@ function toFloat4Param(embedding: Float32Array): number[] {
 
 /**
  * pgvector text literal for batch unnest.
- * node-pg cannot reliably bind float4[][] (collapses to float4[] → cast errors).
+ * node-pg cannot reliably bind float4[][] (collapses to float4[] ΓåÆ cast errors).
  */
 function toVectorLiteral(embedding: Float32Array): string {
   const n = embedding.length;
@@ -161,13 +149,9 @@ function withPoolStartupOptions(
 ): string {
   const flags = [
     "-c jit=off",
-    // Bake HNSW search GUCs into the connection — avoids per-recall set_config.
+    // Bake HNSW search GUCs into the connection ΓÇö avoids per-recall set_config.
     "-c hnsw.ef_search=40",
     "-c hnsw.iterative_scan=relaxed_order",
-    // Bound waits so lock storms cannot hang agents indefinitely.
-    "-c statement_timeout=30000",
-    "-c lock_timeout=10000",
-    "-c idle_in_transaction_session_timeout=60000",
   ];
   if (!durableWrites) {
     flags.unshift("-c synchronous_commit=off");
@@ -198,7 +182,7 @@ const INSERT_ONE_SQL = `WITH mem AS (
  )
  SELECT * FROM mem`;
 
-/** Batch: RETURNING id only — caller rebuilds MemoryRow from inputs. */
+/** Batch: RETURNING id only ΓÇö caller rebuilds MemoryRow from inputs. */
 const INSERT_BATCH_SQL = `WITH mem AS (
    INSERT INTO memories (
      id, organization, agent, content_text, metadata_json,
@@ -236,7 +220,6 @@ const BULK_CHUNK_NO_HNSW = 500;
 const BULK_CHUNK_WITH_HNSW = 250;
 const COPY_BATCH_THRESHOLD = 48;
 
-/** PostgreSQL + pgvector {@link StorageProvider} (`pg` optional peer). */
 export class PostgresStorageProvider implements StorageProvider {
   readonly name = "postgres";
 
@@ -260,23 +243,17 @@ export class PostgresStorageProvider implements StorageProvider {
   private insertFlushScheduled = false;
   private insertFlushTimer: ReturnType<typeof setTimeout> | null = null;
   private insertFlushInFlight = 0;
-  /** Per-provider TX context — never share across PostgresStorageProvider instances. */
-  private readonly txStore = new AsyncLocalStorage<PgPoolClient>();
 
-  /**
-   * @param options - Connection string, pool size, and durability flags.
-   */
   constructor(options: PostgresProviderOptions) {
     this.maxPoolSize = options.maxPoolSize ?? 64;
     this.durableWrites = options.durableWrites !== false;
-    // Bake GUCs into the URL — never SET on 'connect' (races with pool checkout).
+    // Bake GUCs into the URL ΓÇö never SET on 'connect' (races with pool checkout).
     this.connectionString = withPoolStartupOptions(
       options.connectionString,
       this.durableWrites,
     );
   }
 
-  /** Current pg pool occupancy stats (for diagnostics / subscribe setup). */
   getPoolStats(): {
     max: number;
     total: number;
@@ -297,7 +274,6 @@ export class PostgresStorageProvider implements StorageProvider {
     return this.pool;
   }
 
-  /** Open the connection pool and run migrations. */
   async open(): Promise<void> {
     let PoolCtor: new (config: Record<string, unknown>) => PgPool;
     try {
@@ -320,7 +296,7 @@ export class PostgresStorageProvider implements StorageProvider {
         allowExitOnIdle: true,
         keepAlive: true,
       });
-      // Do NOT query on 'connect' — node-pg may check the client out concurrently
+      // Do NOT query on 'connect' ΓÇö node-pg may check the client out concurrently
       // (overlapping query warning + multi-second stalls under concurrency).
       await this.runMigrations();
       this.hasPgvector = await this.tryEnablePgvector();
@@ -333,7 +309,7 @@ export class PostgresStorageProvider implements StorageProvider {
           PostgresStorageProvider.vectorSchemaReady.add(schemaKey);
         } else {
           this.hasPgvector = true;
-          // HNSW may have been dropped by a prior bulk load — check cheaply.
+          // HNSW may have been dropped by a prior bulk load ΓÇö check cheaply.
           const idx = await this.query(
             `SELECT 1 FROM pg_indexes WHERE indexname = 'idx_memory_embeddings_hnsw' LIMIT 1`,
           ).catch(() => ({ rows: [] as Record<string, unknown>[] }));
@@ -353,7 +329,6 @@ export class PostgresStorageProvider implements StorageProvider {
     }
   }
 
-  /** Drain coalesced inserts and end the connection pool. */
   async close(): Promise<void> {
     if (this.insertFlushTimer) {
       clearTimeout(this.insertFlushTimer);
@@ -379,7 +354,7 @@ export class PostgresStorageProvider implements StorageProvider {
   }
 
   /**
-   * Run a search query. HNSW GUCs are baked into pool startup options —
+   * Run a search query. HNSW GUCs are baked into pool startup options ΓÇö
    * no per-recall connect()+set_config round-trip.
    */
   private async withSearchSession<T>(
@@ -404,11 +379,6 @@ export class PostgresStorageProvider implements StorageProvider {
     await this.ensureHnswIndex();
   }
 
-  /**
-   * Create pgvector tables and HNSW index for the given dimensionality.
-   *
-   * @param dimensions - Embedding length from the configured model.
-   */
   async ensureVectorSchema(dimensions: number): Promise<void> {
     const existing = await this.getEmbeddingDimensions();
     if (existing !== null && existing !== dimensions) {
@@ -442,7 +412,7 @@ export class PostgresStorageProvider implements StorageProvider {
       await this.query(
         `ALTER TABLE memory_embeddings ADD COLUMN IF NOT EXISTS archived BOOLEAN NOT NULL DEFAULT false`,
       ).catch(() => undefined);
-      // One-shot denormalization — skip when columns are already populated.
+      // One-shot denormalization ΓÇö skip when columns are already populated.
       const needsBackfill = await this.query(
         `SELECT 1 FROM memory_embeddings WHERE organization IS NULL LIMIT 1`,
       ).catch(() => ({ rows: [] as Record<string, unknown>[] }));
@@ -462,7 +432,7 @@ export class PostgresStorageProvider implements StorageProvider {
          ON memory_embeddings (organization)
          WHERE archived = false`,
       ).catch(() => undefined);
-      // Do not create HNSW here — defer until first search so bulk inserts stay fast.
+      // Do not create HNSW here ΓÇö defer until first search so bulk inserts stay fast.
       const idx = await this.query(
         `SELECT 1 FROM pg_indexes WHERE indexname = 'idx_memory_embeddings_hnsw' LIMIT 1`,
       );
@@ -477,20 +447,36 @@ export class PostgresStorageProvider implements StorageProvider {
     }
   }
 
-  /** Cross-process subscribe: NOTIFY after a committed write. */
-  /**
-   * Issue `pg_notify` for cross-process {@link subscribe} delivery.
-   *
-   * @param event - Memory change payload (IDs + metadata only).
-   */
+  /** Cross-process subscribe: NOTIFY inside the ambient write TX when present. */
   async notifyChange(event: MemoryChangeEvent): Promise<void> {
+    const ambient = txStore.getStore();
+    if (ambient) {
+      await notifyMemoryChange(ambient, event);
+      return;
+    }
     await notifyMemoryChange(this.requirePool(), event);
+  }
+
+  /**
+   * Queue a NOTIFY to flush on the next (or current) write transaction before COMMIT.
+   * Prefer this over post-commit pool NOTIFY so listeners only see committed writes.
+   */
+  queueNotify(event: MemoryChangeEvent): void {
+    this.pendingNotifies.push(event);
+  }
+
+  private pendingNotifies: MemoryChangeEvent[] = [];
+
+  private async flushPendingNotifies(client: PgPoolClient): Promise<void> {
+    const pending = this.pendingNotifies.splice(0);
+    for (const event of pending) {
+      await notifyMemoryChange(client, event);
+    }
   }
   /**
    * Soft reset for a single organization. Drops HNSW only when the embeddings
    * table is empty so other corpora on a shared bench DB stay intact.
    */
-  /** Delete all rows for an organization (dev / test helper). */
   async resetOrganization(organization: string): Promise<void> {
     await this.query(`DELETE FROM memories WHERE organization = $1`, [
       organization,
@@ -509,7 +495,6 @@ export class PostgresStorageProvider implements StorageProvider {
   /**
    * Wipe all Wolbarg tables (explicit opt-in). Prefer {@link resetOrganization}.
    */
-  /** Truncate all Wolbarg tables (dev / test helper). */
   async wipeAllData(): Promise<void> {
     await this.query(`TRUNCATE TABLE memories CASCADE`).catch(() => undefined);
     await this.query(
@@ -576,7 +561,6 @@ export class PostgresStorageProvider implements StorageProvider {
     }
   }
 
-  /** @inheritdoc StorageProvider.getEmbeddingDimensions */
   async getEmbeddingDimensions(): Promise<number | null> {
     const result = await this.query(
       `SELECT value FROM Wolbarg_meta WHERE key = $1`,
@@ -590,7 +574,6 @@ export class PostgresStorageProvider implements StorageProvider {
     return Number.isFinite(parsed) ? parsed : null;
   }
 
-  /** @inheritdoc StorageProvider.setEmbeddingDimensions */
   async setEmbeddingDimensions(dimensions: number): Promise<void> {
     await this.query(
       `INSERT INTO Wolbarg_meta (key, value) VALUES ($1, $2)
@@ -600,18 +583,11 @@ export class PostgresStorageProvider implements StorageProvider {
     this.vectorDimensions = dimensions;
   }
 
-  /** Insert a single memory row (coalesced under concurrent writers). */
   async insertMemory(input: InsertMemoryInput): Promise<MemoryRow> {
     this.requireVectorReady();
 
-    // Inside an ambient transaction (e.g. compress), never join the coalesce
-    // queue — that would commit on a different connection and break atomicity.
-    if (this.txStore.getStore()) {
-      return this.insertMemoryImmediate(input);
-    }
-
-    // Coalesce briefly so concurrent remember() calls share one unnest.
-    // Do NOT hold a global inFlight mutex — that serializes Postgres like SQLite.
+    // Always coalesce briefly so concurrent remember() calls share one unnest.
+    // Do NOT hold a global inFlight mutex ΓÇö that serializes Postgres like SQLite.
     return new Promise<MemoryRow>((resolve, reject) => {
       this.insertQueue.push({ input, resolve, reject });
       if (this.insertQueue.length >= COALESCE_FLUSH_THRESHOLD) {
@@ -671,9 +647,22 @@ export class PostgresStorageProvider implements StorageProvider {
         batch[0]!.resolve(row);
         return;
       }
-      const rows = await this.insertMemoriesBatch(batch.map((b) => b.input));
-      for (let i = 0; i < batch.length; i += 1) {
-        batch[i]!.resolve(rows[i]!);
+      try {
+        const rows = await this.insertMemoriesBatch(batch.map((b) => b.input));
+        for (let i = 0; i < batch.length; i += 1) {
+          batch[i]!.resolve(rows[i]!);
+        }
+      } catch (batchError) {
+        // Poison-row isolation: retry each insert individually.
+        for (const item of batch) {
+          try {
+            const row = await this.insertMemoryImmediate(item.input);
+            item.resolve(row);
+          } catch (rowError) {
+            item.reject(rowError);
+          }
+        }
+        void batchError;
       }
     } catch (error) {
       for (const item of batch) {
@@ -682,7 +671,10 @@ export class PostgresStorageProvider implements StorageProvider {
     } finally {
       this.insertFlushInFlight -= 1;
       if (this.insertQueue.length > 0) {
-        void this.flushInsertQueue();
+        // Yield between parallel flush waves (Phase 1.7 mitigation).
+        setImmediate(() => {
+          void this.flushInsertQueue();
+        });
       }
     }
   }
@@ -710,7 +702,6 @@ export class PostgresStorageProvider implements StorageProvider {
     return this.insertOneBlob(input);
   }
 
-  /** Batch insert via unnest / COPY paths with optional HNSW deferral. */
   async insertMemoriesBatch(inputs: InsertMemoryInput[]): Promise<MemoryRow[]> {
     if (inputs.length === 0) {
       return [];
@@ -779,7 +770,7 @@ export class PostgresStorageProvider implements StorageProvider {
       vectors,
     ]);
 
-    // RETURNING id only — rebuild rows from inputs (avoids shipping JSONB back).
+    // RETURNING id only ΓÇö rebuild rows from inputs (avoids shipping JSONB back).
     return inputs.map((_, i) => ({
       id: ids[i]!,
       organization: orgs[i]!,
@@ -808,7 +799,7 @@ export class PostgresStorageProvider implements StorageProvider {
     for (let i = 0; i < inputs.length; i += chunkSize) {
       chunks.push(inputs.slice(i, i + chunkSize));
     }
-    // No HNSW → pipeline chunks across the pool. With HNSW → sequential (lock-friendly).
+    // No HNSW ΓåÆ pipeline chunks across the pool. With HNSW ΓåÆ sequential (lock-friendly).
     if (!this.hnswIndexEnsured) {
       const parts = await Promise.all(
         chunks.map((chunk) => this.insertBatchPgvector(chunk)),
@@ -884,43 +875,77 @@ export class PostgresStorageProvider implements StorageProvider {
     });
   }
 
-  /** Update memory content, metadata, embedding, and content hash. */
   async updateMemory(input: UpdateMemoryInput): Promise<MemoryRow | null> {
     return this.withTransaction(async () => {
-      const locked = await this.query(
-        `SELECT id, organization, agent, content_text, metadata_json,
-                archived::int AS archived, compressed_into, content_hash, created_at, updated_at
-         FROM memories
-         WHERE id = $1 AND organization = $2
-         FOR UPDATE`,
-        [input.id, input.organization],
-      );
-      if (locked.rows.length === 0) {
+      const existing = await this.getMemoryById(input.id, input.organization);
+      if (!existing) {
         return null;
       }
-      const existing = this.mapRow(locked.rows[0]!);
       const contentHash =
         input.contentHash !== undefined
           ? input.contentHash
           : input.contentText !== undefined
             ? hashMemoryContent(input.contentText)
             : (existing.content_hash ?? null);
-      await this.query(
-        `UPDATE memories SET
-          content_text = COALESCE($1, content_text),
-          metadata_json = COALESCE($2::jsonb, metadata_json),
-          content_hash = COALESCE($3, content_hash),
-          updated_at = $4
-         WHERE id = $5 AND organization = $6`,
-        [
-          input.contentText ?? null,
-          input.metadata !== undefined ? serializeMetadata(input.metadata) : null,
-          contentHash,
-          input.updatedAt,
-          input.id,
-          input.organization,
-        ],
-      );
+
+      if (input.expectedVersion !== undefined) {
+        const cas = await this.query(
+          `UPDATE memories SET
+            content_text = COALESCE($1, content_text),
+            metadata_json = COALESCE($2::jsonb, metadata_json),
+            content_hash = COALESCE($3, content_hash),
+            updated_at = $4,
+            row_version = row_version + 1
+           WHERE id = $5 AND organization = $6 AND row_version = $7
+           RETURNING id`,
+          [
+            input.contentText ?? null,
+            input.metadata !== undefined
+              ? serializeMetadata(input.metadata)
+              : null,
+            contentHash,
+            input.updatedAt,
+            input.id,
+            input.organization,
+            input.expectedVersion,
+          ],
+        );
+        if (cas.rows.length === 0) {
+          const fresh = await this.getMemoryById(input.id, input.organization);
+          throw new VersionConflictError(
+            `Memory version conflict for ${input.id}: expected ${input.expectedVersion}, actual ${fresh?.row_version ?? "unknown"}`,
+            {
+              memoryId: input.id,
+              expectedVersion: input.expectedVersion,
+              actualVersion: fresh?.row_version,
+              reason: "row_version mismatch",
+              suggestion:
+                "Re-read the memory and retry the update with the current version.",
+              operation: "updateMemory",
+            },
+          );
+        }
+      } else {
+        await this.query(
+          `UPDATE memories SET
+            content_text = COALESCE($1, content_text),
+            metadata_json = COALESCE($2::jsonb, metadata_json),
+            content_hash = COALESCE($3, content_hash),
+            updated_at = $4,
+            row_version = COALESCE(row_version, 1) + 1
+           WHERE id = $5 AND organization = $6`,
+          [
+            input.contentText ?? null,
+            input.metadata !== undefined
+              ? serializeMetadata(input.metadata)
+              : null,
+            contentHash,
+            input.updatedAt,
+            input.id,
+            input.organization,
+          ],
+        );
+      }
       if (input.embedding) {
         await this.deleteEmbedding(input.id);
         await this.insertEmbedding(input.id, input.embedding);
@@ -934,7 +959,6 @@ export class PostgresStorageProvider implements StorageProvider {
     });
   }
 
-  /** Find an active memory by org, agent, and content hash (dedupe). */
   async findActiveByContentHash(
     organization: string,
     agent: string,
@@ -952,11 +976,11 @@ export class PostgresStorageProvider implements StorageProvider {
     return row ? this.mapRow(row) : null;
   }
 
-  /** Fetch a memory row by UUID within an organization. */
   async getMemoryById(id: string, organization: string): Promise<MemoryRow | null> {
     const result = await this.query(
       `SELECT id, organization, agent, content_text, metadata_json,
-              archived::int AS archived, compressed_into, content_hash, created_at, updated_at
+              archived::int AS archived, compressed_into, content_hash,
+              COALESCE(row_version, 1) AS row_version, created_at, updated_at
        FROM memories WHERE id = $1 AND organization = $2`,
       [id, organization],
     );
@@ -964,7 +988,6 @@ export class PostgresStorageProvider implements StorageProvider {
     return row ? this.mapRow(row) : null;
   }
 
-  /** Fetch a memory row by internal rowid within an organization. */
   async getMemoryByRowid(rowid: number, organization: string): Promise<MemoryRow | null> {
     const result = await this.query(
       `SELECT m.id, m.organization, m.agent, m.content_text, m.metadata_json,
@@ -979,7 +1002,6 @@ export class PostgresStorageProvider implements StorageProvider {
     return row ? this.mapRow(row) : null;
   }
 
-  /** Batch-fetch memory rows by rowids within an organization. */
   async getMemoriesByRowids(
     rowids: number[],
     organization: string,
@@ -1006,7 +1028,6 @@ export class PostgresStorageProvider implements StorageProvider {
     return out;
   }
 
-  /** List memories matching repository filters with optional limit. */
   async listMemories(filter: RepositoryFilter, limit?: number): Promise<MemoryRow[]> {
     const want =
       limit !== undefined ? limit : filter.metadata ? 10_000 : undefined;
@@ -1074,7 +1095,6 @@ export class PostgresStorageProvider implements StorageProvider {
     return rows;
   }
 
-  /** Scan memories matching metadata filters. */
   async searchByMetadata(
     filter: RepositoryFilter,
     limit?: number,
@@ -1082,7 +1102,6 @@ export class PostgresStorageProvider implements StorageProvider {
     return this.listMemories(filter, limit);
   }
 
-  /** Full-text keyword search via `tsvector` / GIN index. */
   async searchKeyword(
     query: string,
     organization: string,
@@ -1129,7 +1148,6 @@ export class PostgresStorageProvider implements StorageProvider {
     }
   }
 
-  /** pgvector cosine ANN search (HNSW when index is present). */
   async searchVectors(
     embedding: Float32Array,
     topK: number,
@@ -1184,7 +1202,6 @@ export class PostgresStorageProvider implements StorageProvider {
     return scored.slice(0, topK);
   }
 
-  /** ANN search joined with memory rows and org/archived post-filters. */
   async searchVectorsWithMemories(
     embedding: Float32Array,
     topK: number,
@@ -1193,7 +1210,7 @@ export class PostgresStorageProvider implements StorageProvider {
   ): Promise<Array<{ row: MemoryRow; distance: number }>> {
     this.requireVectorReady();
     if (!this.hasPgvector) {
-      // Scope to organization before scoring — shared DBs accumulate many orgs
+      // Scope to organization before scoring ΓÇö shared DBs accumulate many orgs
       // across a suite; global topK + post-filter underfills tenant recalls.
       const clauses = [`m.organization = $1`];
       const params: unknown[] = [organization];
@@ -1241,7 +1258,7 @@ export class PostgresStorageProvider implements StorageProvider {
         distance: Number(row.distance),
       }));
 
-    // Org-scoped exact KNN — avoids filtered-HNSW iterative_scan tax when the
+    // Org-scoped exact KNN ΓÇö avoids filtered-HNSW iterative_scan tax when the
     // shared DB holds many tenants (common in long-lived Postgres). For typical
     // agent memory corpora (<~50k/org) this is faster and more predictable.
     const agentClause = options?.agent ? "AND e.agent = $4" : "";
@@ -1271,7 +1288,6 @@ export class PostgresStorageProvider implements StorageProvider {
     return mapHits(result.rows);
   }
 
-  /** Soft-archive memories (compression / forget paths). */
   async archiveMemories(
     ids: string[],
     organization: string,
@@ -1282,40 +1298,23 @@ export class PostgresStorageProvider implements StorageProvider {
       if (ids.length === 0) {
         return [];
       }
-      // Deterministic lock order prevents multi-row deadlocks across compressors.
-      const orderedIds = [...new Set(ids)].sort();
-      await this.query(
-        `SELECT id FROM memories
-         WHERE organization = $1 AND archived = false AND id = ANY($2::text[])
-         ORDER BY id
-         FOR UPDATE`,
-        [organization, orderedIds],
-      );
       const result = await this.query(
         `UPDATE memories
          SET archived = true, compressed_into = $1, updated_at = $2
          WHERE organization = $3 AND archived = false AND id = ANY($4::text[])
          RETURNING id`,
-        [compressedIntoId, archivedAt, organization, orderedIds],
+        [compressedIntoId, archivedAt, organization, ids],
       );
       const archived = result.rows.map((r) => String(r.id));
       if (archived.length === 0) {
         return [];
       }
-      if (this.hasPgvector) {
-        await this.query(
-          `UPDATE memory_embeddings
-           SET archived = true
-           WHERE memory_id = ANY($1::text[])`,
-          [archived],
-        );
-      } else {
-        // Blob ANN has no archived flag — drop embeddings so exact scan skips them.
-        await this.query(
-          `DELETE FROM memory_embeddings_blob WHERE memory_id = ANY($1::text[])`,
-          [archived],
-        );
-      }
+      await this.query(
+        `UPDATE memory_embeddings
+         SET archived = true
+         WHERE memory_id = ANY($1::text[])`,
+        [archived],
+      );
       const histIds: string[] = [];
       const memIds: string[] = [];
       const types: string[] = [];
@@ -1337,7 +1336,6 @@ export class PostgresStorageProvider implements StorageProvider {
     });
   }
 
-  /** Hard-delete a single memory by id; returns whether a row was removed. */
   async deleteMemoryById(id: string, organization: string): Promise<boolean> {
     const result = await this.query(
       `DELETE FROM memories WHERE id = $1 AND organization = $2`,
@@ -1346,7 +1344,6 @@ export class PostgresStorageProvider implements StorageProvider {
     return (result.rowCount ?? 0) > 0;
   }
 
-  /** Hard-delete memories matching org / agent / metadata filters. */
   async deleteMemoriesByFilter(filter: RepositoryFilter): Promise<number> {
     if (!filter.agent) {
       throw new DatabaseError("deleteMemoriesByFilter requires an agent filter");
@@ -1358,7 +1355,6 @@ export class PostgresStorageProvider implements StorageProvider {
     return result.rowCount ?? 0;
   }
 
-  /** Remove all memories for an organization. */
   async clearOrganization(organization: string): Promise<number> {
     const result = await this.query(
       `DELETE FROM memories WHERE organization = $1`,
@@ -1367,7 +1363,6 @@ export class PostgresStorageProvider implements StorageProvider {
     return result.rowCount ?? 0;
   }
 
-  /** List audit history events for a memory id. */
   async getHistory(memoryId: string): Promise<HistoryRow[]> {
     const result = await this.query(
       `SELECT id, memory_id, event_type, related_memory_id, created_at
@@ -1384,7 +1379,6 @@ export class PostgresStorageProvider implements StorageProvider {
     }));
   }
 
-  /** Append a history row (created / archived / compressed / updated). */
   async insertHistoryEvent(event: HistoryRow): Promise<void> {
     await this.query(
       `INSERT INTO memory_history (id, memory_id, event_type, related_memory_id, created_at)
@@ -1399,7 +1393,6 @@ export class PostgresStorageProvider implements StorageProvider {
     );
   }
 
-  /** Aggregate memory counts for an organization. */
   async getStats(
     organization: string,
   ): Promise<{
@@ -1425,7 +1418,6 @@ export class PostgresStorageProvider implements StorageProvider {
     };
   }
 
-  /** Approximate on-disk database size in bytes (`pg_database_size`). */
   async getDatabaseSizeBytes(): Promise<number> {
     const result = await this.query(
       `SELECT pg_database_size(current_database())::bigint AS size`,
@@ -1434,41 +1426,34 @@ export class PostgresStorageProvider implements StorageProvider {
   }
 
   async withTransaction<T>(fn: () => T | Promise<T>): Promise<T> {
-    const existing = this.txStore.getStore();
+    const existing = txStore.getStore();
     if (existing) {
       return fn();
     }
-
-    const maxAttempts = 5;
-    let lastError: unknown;
-    for (let attempt = 0; attempt < maxAttempts; attempt += 1) {
-      const client = await this.requirePool().connect();
-      try {
-        await client.query("BEGIN");
-        const result = await this.txStore.run(client, fn);
-        await client.query("COMMIT");
-        return result;
-      } catch (error) {
-        await client.query("ROLLBACK").catch(() => undefined);
-        lastError = error;
-        if (isRetriablePgTxError(error) && attempt < maxAttempts - 1) {
-          await new Promise((r) => setTimeout(r, pgTxBackoffMs(attempt)));
-          continue;
-        }
-        if (error instanceof DatabaseError || error instanceof InitializationError) {
-          throw error;
-        }
-        throw new DatabaseError(`Transaction failed: ${this.describe(error)}`, {
-          cause: error instanceof Error ? error : undefined,
-        });
-      } finally {
-        client.release();
+    const client = await this.requirePool().connect();
+    try {
+      await client.query("BEGIN");
+      const result = await txStore.run(client, async () => {
+        const value = await fn();
+        // Drain any queued NOTIFYs on this client before COMMIT so a
+        // rollback cancels both the write and the notification.
+        await this.flushPendingNotifies(client);
+        return value;
+      });
+      await client.query("COMMIT");
+      return result;
+    } catch (error) {
+      this.pendingNotifies.length = 0;
+      await client.query("ROLLBACK").catch(() => undefined);
+      if (error instanceof DatabaseError || error instanceof InitializationError) {
+        throw error;
       }
+      throw new DatabaseError(`Transaction failed: ${this.describe(error)}`, {
+        cause: error instanceof Error ? error : undefined,
+      });
+    } finally {
+      client.release();
     }
-    throw new DatabaseError(
-      `Transaction failed after retries: ${this.describe(lastError)}`,
-      { cause: lastError instanceof Error ? lastError : undefined },
-    );
   }
 
   private async runMigrations(): Promise<void> {
@@ -1495,7 +1480,7 @@ export class PostgresStorageProvider implements StorageProvider {
       );
     }
 
-    // Fast path: schema already current — skip DDL churn and hash backfill.
+    // Fast path: schema already current ΓÇö skip DDL churn and hash backfill.
     if (current === SCHEMA_VERSION) {
       const tsvProbe = await this.query(
         `SELECT 1 FROM information_schema.columns
@@ -1515,6 +1500,8 @@ export class PostgresStorageProvider implements StorageProvider {
         metadata_json JSONB NOT NULL DEFAULT '{}'::jsonb,
         archived BOOLEAN NOT NULL DEFAULT false,
         compressed_into TEXT NULL REFERENCES memories(id) ON DELETE SET NULL,
+        content_hash TEXT NULL,
+        row_version INTEGER NOT NULL DEFAULT 1,
         created_at TIMESTAMPTZ NOT NULL,
         updated_at TIMESTAMPTZ NOT NULL
       )
@@ -1537,7 +1524,7 @@ export class PostgresStorageProvider implements StorageProvider {
     await this.query(
       `CREATE INDEX IF NOT EXISTS idx_memories_org_agent ON memories(organization, agent)`,
     );
-    // Drop redundant archived btree — partial active indexes cover the hot path.
+    // Drop redundant archived btree ΓÇö partial active indexes cover the hot path.
     await this.query(
       `DROP INDEX IF EXISTS idx_memories_org_archived`,
     ).catch(() => undefined);
@@ -1618,12 +1605,16 @@ export class PostgresStorageProvider implements StorageProvider {
     }
 
     await this.query(
+      `ALTER TABLE memories ADD COLUMN IF NOT EXISTS row_version INTEGER NOT NULL DEFAULT 1`,
+    ).catch(() => undefined);
+
+    await this.query(
       `INSERT INTO Wolbarg_meta (key, value) VALUES ($1, $2)
        ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value`,
       [META_KEYS.schemaVersion, String(SCHEMA_VERSION)],
     ).catch(() => undefined);
 
-    // Stored tsvector column — keyword/hybrid avoid re-computing to_tsvector.
+    // Stored tsvector column ΓÇö keyword/hybrid avoid re-computing to_tsvector.
     // Probe first: ALTER on every open is expensive when the column exists.
     const tsvProbe = await this.query(
       `SELECT 1 FROM information_schema.columns
@@ -1731,18 +1722,18 @@ export class PostgresStorageProvider implements StorageProvider {
     text: string,
     params?: unknown[],
   ): Promise<PgQueryResult> {
-    const tx = this.txStore.getStore();
+    const tx = txStore.getStore();
     const target: PgQueryable = tx ?? this.requirePool();
     return target.query(text, params);
   }
 
-  /** Named prepared statement — parse/plan cached per pool connection. */
+  /** Named prepared statement ΓÇö parse/plan cached per pool connection. */
   private async queryNamed(
     name: string,
     text: string,
     params: unknown[],
   ): Promise<PgQueryResult> {
-    const tx = this.txStore.getStore();
+    const tx = txStore.getStore();
     const target: PgQueryable = tx ?? this.requirePool();
     return target.query({ name, text, values: params });
   }
@@ -1782,6 +1773,10 @@ export class PostgresStorageProvider implements StorageProvider {
         row.content_hash === null || row.content_hash === undefined
           ? null
           : String(row.content_hash),
+      row_version:
+        row.row_version === null || row.row_version === undefined
+          ? 1
+          : Number(row.row_version),
       created_at: created,
       updated_at: updated,
       rowid: row.rowid !== undefined ? Number(row.rowid) : undefined,

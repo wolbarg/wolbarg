@@ -19,13 +19,13 @@ describe("sqlite schema v4 optimizations", () => {
     vi.unstubAllGlobals();
   });
 
-  it("opens at schema version 4", async () => {
+  it("opens at schema version 5", async () => {
     const db = (client as unknown as { storage: { getDatabase: () => { prepare: (s: string) => { get: (k: string) => { value: string } } } } }).storage.getDatabase();
     const row = db
       .prepare("SELECT value FROM Wolbarg_meta WHERE key = ?")
       .get("schema_version") as { value: string };
     expect(Number(row.value)).toBe(SCHEMA_VERSION);
-    expect(SCHEMA_VERSION).toBe(4);
+    expect(SCHEMA_VERSION).toBe(5);
   });
 
   it("does not create the redundant global created_at index", async () => {

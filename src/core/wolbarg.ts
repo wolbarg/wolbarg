@@ -637,17 +637,26 @@ export class Wolbarg<HasLlm extends boolean = false> {
         });
       }
 
-      const rows = await this.withWriteLock(async () => {
+      const records = await this.withWriteLock(async () => {
         const tStore = performance.now();
-        const result = await storage.insertMemoriesBatch(inputs);
+        const rows = await storage.insertMemoriesBatch(inputs);
         parent.mark("databaseWriteMs", performance.now() - tStore);
-        return result;
+        const out: RememberResult[] = rows.map((row) => ({
+          ...toMemoryRecord(row),
+          action: "created" as const,
+        }));
+        this.emitChange({
+          event: "remember",
+          organization,
+          agent: commonAgent(items.map((i) => i.agent.trim())) ?? items[0]!.agent,
+          memoryId: out.map((r) => r.id),
+          timestamp,
+          traceId: parent.context.traceId,
+          sessionId: this.telemetry.sessionId,
+        });
+        return out;
       });
 
-      const records: RememberResult[] = rows.map((row) => ({
-        ...toMemoryRecord(row),
-        action: "created" as const,
-      }));
       parent.success({
         provider: storage.name,
         memoryIds: records.map((r) => r.id),
@@ -655,15 +664,6 @@ export class Wolbarg<HasLlm extends boolean = false> {
         embeddingProvider: embedding.model,
         model: embedding.model,
         agentId: commonAgent(items.map((item) => item.agent.trim())),
-      });
-      this.emitChange({
-        event: "remember",
-        organization,
-        agent: commonAgent(items.map((i) => i.agent.trim())) ?? items[0]!.agent,
-        memoryId: records.map((r) => r.id),
-        timestamp,
-        traceId: parent.context.traceId,
-        sessionId: this.telemetry.sessionId,
       });
       return records;
     } catch (error) {
@@ -778,6 +778,12 @@ export class Wolbarg<HasLlm extends boolean = false> {
     id: string;
     content?: { text: string };
     metadata?: MemoryMetadata;
+    /**
+     * Optional optimistic concurrency token from {@link MemoryRecord.version}.
+     * When set, rejects stale concurrent updates with {@link VersionConflictError}.
+     * Omit for last-writer-wins.
+     */
+    expectedVersion?: number;
   }): Promise<RememberResult> {
     const trace = this.telemetry.start("update");
     try {
@@ -820,8 +826,21 @@ export class Wolbarg<HasLlm extends boolean = false> {
             options.content !== undefined
               ? hashMemoryContent(contentText)
               : undefined,
+          expectedVersion: options.expectedVersion,
         });
         trace.mark("databaseWriteMs", performance.now() - tStore);
+        if (updated) {
+          this.emitChange({
+            event: "update",
+            organization,
+            agent: updated.agent,
+            memoryId: updated.id,
+            timestamp,
+            traceId: trace.context.traceId,
+            sessionId: this.telemetry.sessionId,
+            upsertAction: "updated",
+          });
+        }
         return updated;
       });
       if (!row) {
@@ -831,16 +850,6 @@ export class Wolbarg<HasLlm extends boolean = false> {
         ...toMemoryRecord(row),
         action: "updated",
       };
-      this.emitChange({
-        event: "update",
-        organization,
-        agent: result.agent,
-        memoryId: result.id,
-        timestamp,
-        traceId: trace.context.traceId,
-        sessionId: this.telemetry.sessionId,
-        upsertAction: "updated",
-      });
       trace.success({
         provider: storage.name,
         memoryIds: [result.id],
@@ -909,18 +918,15 @@ export class Wolbarg<HasLlm extends boolean = false> {
   private emitChange(event: MemoryChangeEvent): void {
     try {
       if (this.storage instanceof PostgresStorageProvider) {
-        // Avoid an extra pool round-trip when nobody is listening.
-        const listener = this.pgListenBackend as
-          | { hasSubscribers?: () => boolean }
-          | null;
-        if (listener?.hasSubscribers?.()) {
-          void this.storage.notifyChange(event).catch((error) => {
-            console.error(
-              "[wolbarg] NOTIFY failed:",
-              error instanceof Error ? error.message : error,
-            );
-          });
-        }
+        // Always NOTIFY — never gate on local subscribers. A writer process
+        // with zero local listeners must still wake other processes.
+        // Prefer the ambient transaction client when present (in-TX delivery).
+        void this.storage.notifyChange(event).catch((error) => {
+          console.error(
+            "[wolbarg] NOTIFY failed:",
+            error instanceof Error ? error.message : error,
+          );
+        });
         return;
       }
       this.subscribeBackend?.emit(event);
@@ -980,17 +986,18 @@ export class Wolbarg<HasLlm extends boolean = false> {
           contentHash: null,
         });
         trace.mark("databaseWriteMs", performance.now() - tStore);
-        return toMemoryRecord(row);
-      });
-      this.emitChange({
-        event: "remember",
-        organization,
-        agent,
-        memoryId: record.id,
-        timestamp,
-        traceId: trace.context.traceId,
-        sessionId: this.telemetry.sessionId,
-        upsertAction: "created",
+        const rec = toMemoryRecord(row);
+        this.emitChange({
+          event: "remember",
+          organization,
+          agent,
+          memoryId: rec.id,
+          timestamp,
+          traceId: trace.context.traceId,
+          sessionId: this.telemetry.sessionId,
+          upsertAction: "created",
+        });
+        return rec;
       });
       return { ...record, action: "created" };
     }
@@ -2065,33 +2072,48 @@ export class Wolbarg<HasLlm extends boolean = false> {
       const { storage, organization } = await this.requireReady();
 
       const deletedIds: string[] = [];
+      let forgetAgent = "*";
       const deleted = await this.withWriteLock(async () => {
+        let count = 0;
         if ("id" in options && options.id !== undefined) {
           assertNonEmptyString(options.id, "id");
           const id = options.id.trim();
           const ok = await storage.deleteMemoryById(id, organization);
           if (ok) deletedIds.push(id);
-          return ok ? 1 : 0;
-        }
-
-        if ("filter" in options && options.filter?.agent) {
+          count = ok ? 1 : 0;
+          forgetAgent = "*";
+        } else if ("filter" in options && options.filter?.agent) {
           assertNonEmptyString(options.filter.agent, "filter.agent");
+          forgetAgent = options.filter.agent.trim();
           const rows = await storage.listMemories({
             organization,
-            agent: options.filter.agent.trim(),
+            agent: forgetAgent,
             includeArchived: true,
           });
           for (const row of rows) deletedIds.push(row.id);
-          return storage.deleteMemoriesByFilter({
+          count = await storage.deleteMemoriesByFilter({
             organization,
-            agent: options.filter.agent.trim(),
+            agent: forgetAgent,
             includeArchived: true,
           });
+        } else {
+          throw new ValidationError(
+            "forget requires either { id } or { filter: { agent } }",
+          );
         }
 
-        throw new ValidationError(
-          "forget requires either { id } or { filter: { agent } }",
-        );
+        if (count > 0) {
+          this.emitChange({
+            event: "forget",
+            organization,
+            agent: forgetAgent,
+            memoryId:
+              "id" in options && options.id ? options.id.trim() : [],
+            timestamp: nowIso(),
+            sessionId: this.telemetry.sessionId,
+          });
+        }
+        return count;
       });
 
       if (deleted > 0 && this.graph && deletedIds.length > 0) {
@@ -2113,19 +2135,6 @@ export class Wolbarg<HasLlm extends boolean = false> {
           ? { graphCascade: deletedIds.length }
           : undefined,
       });
-      if (deleted > 0) {
-        this.emitChange({
-          event: "forget",
-          organization,
-          agent:
-            ("filter" in options && options.filter?.agent?.trim()) ||
-            ("id" in options ? "*" : "*"),
-          memoryId:
-            "id" in options && options.id ? options.id.trim() : [],
-          timestamp: nowIso(),
-          sessionId: this.telemetry.sessionId,
-        });
-      }
       return deleted;
     } catch (error) {
       trace.failure(error, {
@@ -2556,13 +2565,21 @@ export class Wolbarg<HasLlm extends boolean = false> {
     fn: () => Promise<T>,
     options?: { exclusive?: boolean },
   ): Promise<T> {
-    if (
-      options?.exclusive &&
-      this.storage?.name === "sqlite"
-    ) {
-      return this.writeMutex.runExclusive(fn);
+    const run = (): Promise<T> => {
+      if (
+        options?.exclusive &&
+        this.storage?.name === "sqlite"
+      ) {
+        return this.writeMutex.runExclusive(fn);
+      }
+      return fn();
+    };
+
+    // Postgres: open an ambient TX so insert/update + NOTIFY share one COMMIT.
+    if (this.storage instanceof PostgresStorageProvider) {
+      return this.storage.withTransaction(() => run());
     }
-    return fn();
+    return run();
   }
 
   /**

@@ -2,10 +2,8 @@
  * SQL schema constants and migration statements.
  */
 
-/** Current schema version written to `Wolbarg_meta.schema_version`. */
-export const SCHEMA_VERSION = 4;
+export const SCHEMA_VERSION = 5;
 
-/** Keys stored in the `Wolbarg_meta` key-value table. */
 export const META_KEYS = {
   schemaVersion: "schema_version",
   embeddingDimensions: "embedding_dimensions",
@@ -32,6 +30,7 @@ CREATE TABLE IF NOT EXISTS memories (
   archived INTEGER NOT NULL DEFAULT 0 CHECK (archived IN (0, 1)),
   compressed_into TEXT NULL,
   content_hash TEXT NULL,
+  row_version INTEGER NOT NULL DEFAULT 1,
   created_at TEXT NOT NULL,
   updated_at TEXT NOT NULL,
   FOREIGN KEY (compressed_into) REFERENCES memories(id) ON DELETE SET NULL
@@ -83,7 +82,7 @@ CREATE TABLE IF NOT EXISTS embedding_cache (
 `;
 
 /**
- * Graph memory tables (SQLite graph provider — separate DB file by default).
+ * Graph memory tables (SQLite graph provider ΓÇö separate DB file by default).
  * `type` is the node kind (`memory` | `entity`); entity classification lives in metadata.
  */
 export const CREATE_GRAPH_NODES_TABLE = `
@@ -141,7 +140,7 @@ export const CREATE_INDEXES = [
      ON embedding_cache(last_used_at);`,
 ] as const;
 
-/** Dropped in schema v4 — global created_at index was unused (all queries scope by org). */
+/** Dropped in schema v4 ΓÇö global created_at index was unused (all queries scope by org). */
 export const DROP_REDUNDANT_INDEXES_V4 = [
   `DROP INDEX IF EXISTS idx_memories_created_at;`,
 ] as const;
@@ -149,10 +148,6 @@ export const DROP_REDUNDANT_INDEXES_V4 = [
 /**
  * Build the vec0 virtual table DDL for a fixed embedding dimensionality.
  * Cosine distance enables similarity = 1 - distance.
- *
- * @param dimensions - Embedding vector length (positive integer).
- * @returns `CREATE VIRTUAL TABLE … vec0(…)` DDL string.
- * @throws {Error} When dimensions is not a positive integer.
  */
 export function buildVectorTableSql(dimensions: number): string {
   if (!Number.isInteger(dimensions) || dimensions <= 0) {

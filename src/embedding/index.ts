@@ -37,7 +37,22 @@
 
 import type { EmbeddingConfig } from "../types/index.js";
 import { EmbeddingError } from "../errors/index.js";
-import { joinUrl } from "../utils/index.js";
+import {
+  deadlineExceeded,
+  fullJitterDelay,
+  joinUrl,
+  parseRetryAfterMs,
+  resolveBackoffConfig,
+  sleep,
+  type ResolvedBackoffConfig,
+} from "../utils/index.js";
+
+const DEFAULT_HTTP_RETRY: ResolvedBackoffConfig = resolveBackoffConfig({
+  maxRetries: 5,
+  baseBackoffMs: 200,
+  maxBackoffMs: 8_000,
+  deadlineMs: 60_000,
+});
 
 /**
  * Contract for any embedding backend used by Wolbarg.
@@ -90,6 +105,7 @@ export class OpenAICompatibleEmbeddingProvider implements EmbeddingProvider {
   private readonly baseUrl: string;
   private readonly apiKey: string;
   private readonly timeoutMs: number;
+  private readonly retry: ResolvedBackoffConfig;
 
   /**
    * @param config - OpenAI-compatible embedding endpoint settings.
@@ -104,6 +120,7 @@ export class OpenAICompatibleEmbeddingProvider implements EmbeddingProvider {
     this.apiKey = config.apiKey;
     this.model = config.model;
     this.timeoutMs = config.timeoutMs ?? 30_000;
+    this.retry = DEFAULT_HTTP_RETRY;
   }
 
   /**
@@ -188,54 +205,95 @@ export class OpenAICompatibleEmbeddingProvider implements EmbeddingProvider {
     input: string | string[],
   ): Promise<OpenAIEmbeddingResponse> {
     const url = joinUrl(this.baseUrl, "/embeddings");
-    const controller = new AbortController();
-    const timer = setTimeout(() => controller.abort(), this.timeoutMs);
+    const startedAt = performance.now();
+    let lastError: unknown;
 
-    try {
-      const res = await fetch(url, {
-        method: "POST",
-        headers: {
-          "Content-Type": "application/json",
-          Authorization: `Bearer ${this.apiKey}`,
-        },
-        body: JSON.stringify({
-          model: this.model,
-          input,
-        }),
-        signal: controller.signal,
-      });
+    for (let attempt = 0; attempt <= this.retry.maxRetries; attempt += 1) {
+      if (attempt > 0 && deadlineExceeded(startedAt, this.retry)) {
+        break;
+      }
+      const controller = new AbortController();
+      const timer = setTimeout(() => controller.abort(), this.timeoutMs);
 
-      let body: OpenAIEmbeddingResponse;
       try {
-        body = (await res.json()) as OpenAIEmbeddingResponse;
-      } catch {
-        throw new EmbeddingError(
-          `Embedding endpoint returned non-JSON response (HTTP ${res.status})`,
-        );
-      }
+        const res = await fetch(url, {
+          method: "POST",
+          headers: {
+            "Content-Type": "application/json",
+            Authorization: `Bearer ${this.apiKey}`,
+          },
+          body: JSON.stringify({
+            model: this.model,
+            input,
+          }),
+          signal: controller.signal,
+        });
 
-      if (!res.ok) {
-        const message = body.error?.message ?? `HTTP ${res.status}`;
-        throw new EmbeddingError(`Embedding request failed: ${message}`);
-      }
+        let body: OpenAIEmbeddingResponse;
+        try {
+          body = (await res.json()) as OpenAIEmbeddingResponse;
+        } catch {
+          throw new EmbeddingError(
+            `Embedding endpoint returned non-JSON response (HTTP ${res.status})`,
+          );
+        }
 
-      return body;
-    } catch (error) {
-      if (error instanceof EmbeddingError) {
-        throw error;
-      }
-      if (error instanceof Error && error.name === "AbortError") {
+        if (res.status === 429) {
+          lastError = new EmbeddingError(
+            `Embedding request failed: ${body.error?.message ?? "HTTP 429"}`,
+          );
+          if (
+            attempt >= this.retry.maxRetries ||
+            deadlineExceeded(startedAt, this.retry)
+          ) {
+            throw new EmbeddingError(
+              `Embedding request failed after ${attempt + 1} attempts (HTTP 429 rate limit)`,
+              {
+                cause: lastError instanceof Error ? lastError : undefined,
+                reason: "HTTP 429 retries exhausted",
+                suggestion:
+                  "Reduce embedding request rate, raise provider quota, or retry later.",
+              },
+            );
+          }
+          const retryAfter = parseRetryAfterMs(res.headers.get("retry-after"));
+          await sleep(retryAfter ?? fullJitterDelay(attempt, this.retry));
+          continue;
+        }
+
+        if (!res.ok) {
+          const message = body.error?.message ?? `HTTP ${res.status}`;
+          throw new EmbeddingError(`Embedding request failed: ${message}`);
+        }
+
+        return body;
+      } catch (error) {
+        if (error instanceof EmbeddingError) {
+          throw error;
+        }
+        if (error instanceof Error && error.name === "AbortError") {
+          throw new EmbeddingError(
+            `Embedding request timed out after ${this.timeoutMs}ms`,
+          );
+        }
         throw new EmbeddingError(
-          `Embedding request timed out after ${this.timeoutMs}ms`,
+          `Embedding request failed: ${this.describe(error)}`,
+          { cause: error instanceof Error ? error : undefined },
         );
+      } finally {
+        clearTimeout(timer);
       }
-      throw new EmbeddingError(
-        `Embedding request failed: ${this.describe(error)}`,
-        { cause: error instanceof Error ? error : undefined },
-      );
-    } finally {
-      clearTimeout(timer);
     }
+
+    throw new EmbeddingError(
+      `Embedding request failed after retries (HTTP 429 rate limit)`,
+      {
+        cause: lastError instanceof Error ? lastError : undefined,
+        reason: "HTTP 429 retries exhausted",
+        suggestion:
+          "Reduce embedding request rate, raise provider quota, or retry later.",
+      },
+    );
   }
 
   /** @param error - Unknown thrown value. @returns Human-readable message. */

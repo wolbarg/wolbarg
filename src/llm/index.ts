@@ -35,7 +35,22 @@
 
 import type { LlmConfig } from "../types/index.js";
 import { CompressionError } from "../errors/index.js";
-import { joinUrl } from "../utils/index.js";
+import {
+  deadlineExceeded,
+  fullJitterDelay,
+  joinUrl,
+  parseRetryAfterMs,
+  resolveBackoffConfig,
+  sleep,
+  type ResolvedBackoffConfig,
+} from "../utils/index.js";
+
+const DEFAULT_HTTP_RETRY: ResolvedBackoffConfig = resolveBackoffConfig({
+  maxRetries: 5,
+  baseBackoffMs: 200,
+  maxBackoffMs: 8_000,
+  deadlineMs: 60_000,
+});
 
 /**
  * One message in a chat completion request.
@@ -119,6 +134,7 @@ export class OpenAICompatibleLlmProvider implements LlmProvider {
   private readonly temperature: number;
   private readonly maxTokens: number;
   private readonly timeoutMs: number;
+  private readonly retry: ResolvedBackoffConfig;
 
   /**
    * @param config - OpenAI-compatible endpoint settings.
@@ -137,6 +153,7 @@ export class OpenAICompatibleLlmProvider implements LlmProvider {
     this.temperature = config.temperature ?? 0.2;
     this.maxTokens = config.maxTokens ?? 4096;
     this.timeoutMs = config.timeoutMs ?? 60_000;
+    this.retry = DEFAULT_HTTP_RETRY;
   }
 
   /**
@@ -190,55 +207,96 @@ export class OpenAICompatibleLlmProvider implements LlmProvider {
    */
   private async request(messages: ChatMessage[]): Promise<OpenAIChatResponse> {
     const url = joinUrl(this.baseUrl, "/chat/completions");
-    const controller = new AbortController();
-    const timer = setTimeout(() => controller.abort(), this.timeoutMs);
+    const startedAt = performance.now();
+    let lastError: unknown;
 
-    try {
-      const res = await fetch(url, {
-        method: "POST",
-        headers: {
-          "Content-Type": "application/json",
-          Authorization: `Bearer ${this.apiKey}`,
-        },
-        body: JSON.stringify({
-          model: this.model,
-          messages,
-          temperature: this.temperature,
-          max_tokens: this.maxTokens,
-        }),
-        signal: controller.signal,
-      });
+    for (let attempt = 0; attempt <= this.retry.maxRetries; attempt += 1) {
+      if (attempt > 0 && deadlineExceeded(startedAt, this.retry)) {
+        break;
+      }
+      const controller = new AbortController();
+      const timer = setTimeout(() => controller.abort(), this.timeoutMs);
 
-      let body: OpenAIChatResponse;
       try {
-        body = (await res.json()) as OpenAIChatResponse;
-      } catch {
-        throw new CompressionError(
-          `LLM endpoint returned non-JSON response (HTTP ${res.status})`,
-        );
-      }
+        const res = await fetch(url, {
+          method: "POST",
+          headers: {
+            "Content-Type": "application/json",
+            Authorization: `Bearer ${this.apiKey}`,
+          },
+          body: JSON.stringify({
+            model: this.model,
+            messages,
+            temperature: this.temperature,
+            max_tokens: this.maxTokens,
+          }),
+          signal: controller.signal,
+        });
 
-      if (!res.ok) {
-        const message = body.error?.message ?? `HTTP ${res.status}`;
-        throw new CompressionError(`LLM request failed: ${message}`);
-      }
+        let body: OpenAIChatResponse;
+        try {
+          body = (await res.json()) as OpenAIChatResponse;
+        } catch {
+          throw new CompressionError(
+            `LLM endpoint returned non-JSON response (HTTP ${res.status})`,
+          );
+        }
 
-      return body;
-    } catch (error) {
-      if (error instanceof CompressionError) {
-        throw error;
+        if (res.status === 429) {
+          lastError = new CompressionError(
+            `LLM request failed: ${body.error?.message ?? "HTTP 429"}`,
+          );
+          if (
+            attempt >= this.retry.maxRetries ||
+            deadlineExceeded(startedAt, this.retry)
+          ) {
+            throw new CompressionError(
+              `LLM request failed after ${attempt + 1} attempts (HTTP 429 rate limit)`,
+              {
+                cause: lastError instanceof Error ? lastError : undefined,
+                reason: "HTTP 429 retries exhausted",
+                suggestion:
+                  "Reduce LLM request rate, raise provider quota, or retry later.",
+              },
+            );
+          }
+          const retryAfter = parseRetryAfterMs(res.headers.get("retry-after"));
+          await sleep(retryAfter ?? fullJitterDelay(attempt, this.retry));
+          continue;
+        }
+
+        if (!res.ok) {
+          const message = body.error?.message ?? `HTTP ${res.status}`;
+          throw new CompressionError(`LLM request failed: ${message}`);
+        }
+
+        return body;
+      } catch (error) {
+        if (error instanceof CompressionError) {
+          throw error;
+        }
+        if (error instanceof Error && error.name === "AbortError") {
+          throw new CompressionError(
+            `LLM request timed out after ${this.timeoutMs}ms`,
+          );
+        }
+        throw new CompressionError(`LLM request failed: ${this.describe(error)}`, {
+          cause: error instanceof Error ? error : undefined,
+        });
+      } finally {
+        clearTimeout(timer);
       }
-      if (error instanceof Error && error.name === "AbortError") {
-        throw new CompressionError(
-          `LLM request timed out after ${this.timeoutMs}ms`,
-        );
-      }
-      throw new CompressionError(`LLM request failed: ${this.describe(error)}`, {
-        cause: error instanceof Error ? error : undefined,
-      });
-    } finally {
-      clearTimeout(timer);
     }
+
+    throw new CompressionError(
+      `LLM request failed after retries (HTTP 429 rate limit)`,
+      {
+        cause: lastError instanceof Error ? lastError : undefined,
+        reason: "HTTP 429 retries exhausted",
+        suggestion:
+          "Reduce LLM request rate, raise provider quota, or retry later.",
+      },
+    );
   }
 
   /** @param error - Unknown thrown value. @returns Human-readable message. */

@@ -144,6 +144,34 @@ export class StorageLockedError extends WolbargError {
   }
 }
 
+/**
+ * Thrown when an optimistic-concurrency update fails (`expectedVersion` mismatch).
+ * Stable code: `WOLBARG_VERSION_CONFLICT`.
+ */
+export class VersionConflictError extends WolbargError {
+  readonly memoryId: string;
+  readonly expectedVersion: number;
+  readonly actualVersion?: number;
+
+  constructor(
+    message: string,
+    options: ErrorOptions & {
+      memoryId: string;
+      expectedVersion: number;
+      actualVersion?: number;
+      reason?: string;
+      suggestion?: string;
+      operation?: string;
+    },
+  ) {
+    super(message, "WOLBARG_VERSION_CONFLICT", options);
+    this.name = "VersionConflictError";
+    this.memoryId = options.memoryId;
+    this.expectedVersion = options.expectedVersion;
+    this.actualVersion = options.actualVersion;
+  }
+}
+
 /** Thrown when an embedding API request fails or returns invalid vectors. */
 export class EmbeddingError extends WolbargError {
   /**

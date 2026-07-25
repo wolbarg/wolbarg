@@ -10,13 +10,12 @@
  * - Blob + cosine fallback on unsupported platforms (e.g. win32-arm64)
  */
 
-import { AsyncLocalStorage } from "node:async_hooks";
 import fs from "node:fs";
 import path from "node:path";
 import { DatabaseSync, type StatementSync } from "node:sqlite";
 import * as sqliteVec from "sqlite-vec";
 
-import { DatabaseError, InitializationError } from "../../errors/index.js";
+import { DatabaseError, InitializationError, VersionConflictError } from "../../errors/index.js";
 import { matchesMetadata } from "../../filters/match.js";
 import { compileMetadataFilterToSql } from "../../filters/sql-compile.js";
 import { WolbargLogger } from "../../telemetry/logger.js";
@@ -36,7 +35,6 @@ import {
 } from "../../schema/index.js";
 import { SQL } from "../../sql/index.js";
 import {
-  AsyncMutex,
   deserializeMetadata,
   embeddingToBuffer,
   serializeMetadata,
@@ -60,17 +58,14 @@ import {
   type ConcurrencyConfig,
   type ResolvedConcurrencyConfig,
 } from "../sqlite/concurrency-config.js";
-import {
-  withImmediateTransaction,
-  isSqliteBusyError,
-} from "../sqlite/transaction.js";
+import { withImmediateTransaction } from "../sqlite/transaction.js";
 import { hashMemoryContent } from "../../memory/dedupe.js";
 
 /** Hard cap when metadata cannot be fully pushed to SQL (prevents O(n) RAM blowups). */
 const MAX_METADATA_SCAN = 50_000;
 const METADATA_PAGE_SIZE = 500;
 /**
- * Multi-row INSERT chunk size. SQLite default bind limit is 999; 9 binds/row → 110.
+ * Multi-row INSERT chunk size. SQLite default bind limit is 999; 9 binds/row ΓåÆ 110.
  * Leave headroom for side-table multi-value inserts in the same transaction.
  */
 const BATCH_INSERT_CHUNK = 96;
@@ -89,6 +84,7 @@ interface PreparedStatements {
   setMeta: StatementSync;
   insertMemory: StatementSync;
   updateMemoryContent: StatementSync;
+  updateMemoryContentCas: StatementSync;
   getMemoryById: StatementSync;
   getMemoryByRowid: StatementSync;
   findActiveByContentHash: StatementSync;
@@ -121,15 +117,10 @@ interface PreparedStatements {
 }
 
 export interface SqliteProviderOptions {
-  /** Filesystem path or `:memory:` connection string. */
   connectionString: string;
-  /** Optional write-lock tuning for concurrent async callers. */
   concurrency?: ConcurrencyConfig;
 }
 
-/**
- * SQLite + sqlite-vec {@link StorageProvider} (Node.js built-in `node:sqlite`).
- */
 export class SqliteStorageProvider implements StorageProvider {
   readonly name = "sqlite";
 
@@ -144,27 +135,13 @@ export class SqliteStorageProvider implements StorageProvider {
   private transactionDepth = 0;
   /** Incrementing counter for deterministic savepoint names. */
   private savepointCounter = 0;
-  /**
-   * Serializes top-level write transactions on the single SQLite connection.
-   * SQLite is single-writer; serializing in-process avoids SQLITE_BUSY churn
-   * AND prevents interleaved BEGIN/SAVEPOINT state corruption when many async
-   * callers share one connection (see "no such savepoint" class of bugs).
-   */
-  private readonly writeMutex = new AsyncMutex();
-  /**
-   * Async-context flag: true while executing inside a top-level write
-   * transaction held by this provider. Used so writes issued from within an
-   * ambient transaction (e.g. compress()) join that ACID unit, WITHOUT
-   * mistaking the coalescer's own flush window for an ambient transaction.
-   */
-  private readonly txContext = new AsyncLocalStorage<boolean>();
   /** Hot in-process ANN for blob backend (sqlite-vec unavailable platforms). */
   private memoryIndex: InMemoryVectorIndex | null = null;
   private memoryIndexDirty = false;
-  /** Resolved absolute path (or `:memory:`) — avoid re-resolving on size checks. */
+  /** Resolved absolute path (or `:memory:`) ΓÇö avoid re-resolving on size checks. */
   private resolvedPath: string | null = null;
   private retryLog: ((msg: string) => void) | null = null;
-  /** Cached prepared statements for `rowid IN (…)` lookups keyed by list length. */
+  /** Cached prepared statements for `rowid IN (ΓÇª)` lookups keyed by list length. */
   private rowidInStatements = new Map<number, StatementSync>();
   /** Cached list SQL statements keyed by clause shape. */
   private listStatements = new Map<string, StatementSync>();
@@ -183,10 +160,9 @@ export class SqliteStorageProvider implements StorageProvider {
     reject: (err: unknown) => void;
   }> = [];
   private insertFlushScheduled = false;
+  /** Prevents concurrent flushInsertQueue races (nested SAVEPOINT / double-insert). */
+  private insertFlushInFlight = false;
 
-  /**
-   * @param options - SQLite path / `:memory:` and optional concurrency config.
-   */
   constructor(options: SqliteProviderOptions) {
     this.connectionString = options.connectionString;
     this.concurrency = resolveConcurrencyConfig(options.concurrency);
@@ -202,118 +178,83 @@ export class SqliteStorageProvider implements StorageProvider {
     return this.db;
   }
 
-  /** Register a callback invoked when SQLite busy retries occur (tests / diagnostics). */
   setRetryLogger(fn: ((msg: string) => void) | null): void {
     this.retryLog = fn;
   }
 
-  /** Open the database, run migrations, and prepare statements. */
   async open(): Promise<void> {
-    // Opening + WAL switch + migrations take brief locks. Under a startup storm
-    // (many processes opening one file at once) these can throw SQLITE_BUSY
-    // BEFORE any per-write retry loop applies, so retry the whole open here.
-    const startedAt = performance.now();
-    let attempt = 0;
-    for (;;) {
-      try {
-        this.openOnce();
-        return;
-      } catch (error) {
-        try {
-          this.db?.close();
-        } catch {
-          // ignore close errors during failed open
-        }
-        this.db = null;
-        this.statements = null;
+    try {
+      const dbPath = this.resolvePath(this.connectionString);
+      this.resolvedPath = dbPath;
+      if (dbPath !== ":memory:") {
+        fs.mkdirSync(path.dirname(dbPath), { recursive: true });
+      }
 
-        const busy = isSqliteBusyError(error);
-        const exhausted =
-          attempt >= this.concurrency.maxRetries ||
-          performance.now() - startedAt >= this.concurrency.lockDeadlineMs;
-        if (!busy || exhausted) {
-          throw new InitializationError(
-            `Failed to open SQLite database: ${this.describe(error)}`,
-            { cause: error instanceof Error ? error : undefined },
+      const db = new DatabaseSync(dbPath, { allowExtension: true });
+      this.db = db;
+
+      // WAL + NORMAL is the production-safe default (multi-reader friendly).
+      // Single-process SDK keeps locking_mode=NORMAL (not EXCLUSIVE) so other
+      // tools/processes can open the same file for backups or inspection.
+      db.exec("PRAGMA journal_mode = WAL;");
+      db.exec(`
+        PRAGMA synchronous = NORMAL;
+        PRAGMA foreign_keys = ON;
+        PRAGMA busy_timeout = ${this.concurrency.lockTimeoutMs};
+        PRAGMA temp_store = MEMORY;
+        PRAGMA cache_size = -32768;
+        PRAGMA mmap_size = 134217728;
+        PRAGMA wal_autocheckpoint = 2000;
+        PRAGMA recursive_triggers = OFF;
+      `);
+
+      this.sqliteVecLoaded = this.tryLoadSqliteVec(db);
+      this.runMigrations(db);
+      this.statements = this.prepareStatements(db);
+      // FTS consistency check only on fresh / upgraded DBs (see runMigrations).
+      // Re-scanning every warm open costs measurable ms for no benefit.
+
+      const backend = this.readMetaString(META_KEYS.vectorBackend) as VectorBackend | null;
+      const dims = this.readMetaNumber(META_KEYS.embeddingDimensions);
+
+      if (backend) {
+        this.vectorBackend = backend;
+      } else if (this.sqliteVecLoaded) {
+        this.vectorBackend = "sqlite-vec";
+      } else {
+        if (!warnedSqliteVecFallback) {
+          warnedSqliteVecFallback = true;
+          warnLogger.warn(
+            "sqlite-vec unavailable on this platform; using blob ANN fallback.",
           );
         }
-        const base = Math.min(
-          this.concurrency.maxBackoffMs,
-          this.concurrency.baseBackoffMs * 2 ** attempt,
-        );
-        const delay = Math.random() * base;
-        this.retryLog?.(
-          `SQLITE_BUSY during open attempt=${attempt + 1} backoffMs=${Math.round(delay)}`,
-        );
-        attempt += 1;
-        await new Promise((r) => setTimeout(r, delay));
+        this.vectorBackend = "blob";
       }
+
+      if (dims !== null) {
+        this.vectorDimensions = dims;
+        this.ensureVectorStorage(dims);
+        this.reprepareVectorStatements();
+        // Blob ANN hydrate is deferred until first search (warm-start win).
+        if (this.vectorBackend === "blob") {
+          this.memoryIndexDirty = true;
+        }
+      }
+    } catch (error) {
+      try {
+        this.db?.close();
+      } catch {
+        // ignore close errors during failed open
+      }
+      this.db = null;
+      this.statements = null;
+      throw new InitializationError(
+        `Failed to open SQLite database: ${this.describe(error)}`,
+        { cause: error instanceof Error ? error : undefined },
+      );
     }
   }
 
-  /** Single open attempt — connect, apply pragmas, migrate, prepare. */
-  private openOnce(): void {
-    const dbPath = this.resolvePath(this.connectionString);
-    this.resolvedPath = dbPath;
-    if (dbPath !== ":memory:") {
-      fs.mkdirSync(path.dirname(dbPath), { recursive: true });
-    }
-
-    const db = new DatabaseSync(dbPath, { allowExtension: true });
-    this.db = db;
-
-    // busy_timeout must be set FIRST so the WAL switch + migrations below wait
-    // for a contended lock instead of failing fast during a startup storm.
-    db.exec(`PRAGMA busy_timeout = ${this.concurrency.lockTimeoutMs};`);
-    // WAL + NORMAL is the production-safe default (multi-reader friendly).
-    // Single-process SDK keeps locking_mode=NORMAL (not EXCLUSIVE) so other
-    // tools/processes can open the same file for backups or inspection.
-    db.exec("PRAGMA journal_mode = WAL;");
-    db.exec(`
-      PRAGMA synchronous = NORMAL;
-      PRAGMA foreign_keys = ON;
-      PRAGMA temp_store = MEMORY;
-      PRAGMA cache_size = -32768;
-      PRAGMA mmap_size = 134217728;
-      PRAGMA wal_autocheckpoint = 2000;
-      PRAGMA recursive_triggers = OFF;
-    `);
-
-    this.sqliteVecLoaded = this.tryLoadSqliteVec(db);
-    this.runMigrations(db);
-    this.statements = this.prepareStatements(db);
-    // FTS consistency check only on fresh / upgraded DBs (see runMigrations).
-    // Re-scanning every warm open costs measurable ms for no benefit.
-
-    const backend = this.readMetaString(META_KEYS.vectorBackend) as VectorBackend | null;
-    const dims = this.readMetaNumber(META_KEYS.embeddingDimensions);
-
-    if (backend) {
-      this.vectorBackend = backend;
-    } else if (this.sqliteVecLoaded) {
-      this.vectorBackend = "sqlite-vec";
-    } else {
-      if (!warnedSqliteVecFallback) {
-        warnedSqliteVecFallback = true;
-        warnLogger.warn(
-          "sqlite-vec unavailable on this platform; using blob ANN fallback.",
-        );
-      }
-      this.vectorBackend = "blob";
-    }
-
-    if (dims !== null) {
-      this.vectorDimensions = dims;
-      this.ensureVectorStorage(dims);
-      this.reprepareVectorStatements();
-      // Blob ANN hydrate is deferred until first search (warm-start win).
-      if (this.vectorBackend === "blob") {
-        this.memoryIndexDirty = true;
-      }
-    }
-  }
-
-  /** Drain pending inserts, optimize, and close the SQLite connection. */
   async close(): Promise<void> {
     // Drain coalesced inserts before tearing down the connection.
     const deadline = Date.now() + 2_000;
@@ -328,7 +269,7 @@ export class SqliteStorageProvider implements StorageProvider {
       try {
         this.db.exec("PRAGMA optimize;");
       } catch {
-        // ignore — optimize is best-effort
+        // ignore ΓÇö optimize is best-effort
       }
       this.db.close();
     } catch (error) {
@@ -348,11 +289,6 @@ export class SqliteStorageProvider implements StorageProvider {
     }
   }
 
-  /**
-   * Create or validate vec0 / blob vector storage for the given dimensionality.
-   *
-   * @param dimensions - Embedding length from the configured model.
-   */
   async ensureVectorSchema(dimensions: number): Promise<void> {
     const existing = await this.getEmbeddingDimensions();
     if (existing !== null && existing !== dimensions) {
@@ -381,28 +317,17 @@ export class SqliteStorageProvider implements StorageProvider {
     this.hydrateMemoryIndex();
   }
 
-  /** @inheritdoc StorageProvider.getEmbeddingDimensions */
   async getEmbeddingDimensions(): Promise<number | null> {
     return this.readMetaNumber(META_KEYS.embeddingDimensions);
   }
 
-  /** @inheritdoc StorageProvider.setEmbeddingDimensions */
   async setEmbeddingDimensions(dimensions: number): Promise<void> {
     await this.setMeta(META_KEYS.embeddingDimensions, String(dimensions));
     this.vectorDimensions = dimensions;
   }
 
-  /** Insert a single memory row (coalesced under concurrent writers). */
   async insertMemory(input: InsertMemoryInput): Promise<MemoryRow> {
     this.requireVectorReady();
-    // Inside an ambient transaction (e.g. compress), write immediately so the
-    // insert participates in the outer ACID unit instead of the coalesce queue.
-    // Gate on the async-context flag (NOT transactionDepth): the coalescer's
-    // own flush transiently sets transactionDepth while awaiting, and a
-    // concurrent remember() must NOT be pulled onto the savepoint path there.
-    if (this.txContext.getStore() === true) {
-      return this.insertMemoryImmediate(input);
-    }
     // Coalesce concurrent writers into one BEGIN IMMEDIATE + multi-row insert.
     // Without this, each remember() pays a full fsync-bound commit.
     return new Promise<MemoryRow>((resolve, reject) => {
@@ -429,27 +354,54 @@ export class SqliteStorageProvider implements StorageProvider {
   }
 
   private async flushInsertQueue(): Promise<void> {
-    if (this.insertQueue.length === 0) {
+    if (this.insertFlushInFlight || this.insertQueue.length === 0) {
       return;
     }
-    const batch = this.insertQueue.splice(0, INSERT_COALESCE_MAX);
+    this.insertFlushInFlight = true;
     try {
-      if (batch.length === 1) {
-        const row = await this.insertMemoryImmediate(batch[0]!.input);
-        batch[0]!.resolve(row);
-      } else {
-        const rows = await this.insertMemoriesBatch(batch.map((b) => b.input));
-        for (let i = 0; i < batch.length; i += 1) {
-          batch[i]!.resolve(rows[i]!);
+      while (this.insertQueue.length > 0) {
+        const batch = this.insertQueue.splice(0, INSERT_COALESCE_MAX);
+        try {
+          if (batch.length === 1) {
+            const row = await this.insertMemoryImmediate(batch[0]!.input);
+            batch[0]!.resolve(row);
+          } else {
+            try {
+              const rows = await this.insertMemoriesBatch(batch.map((b) => b.input));
+              for (let i = 0; i < batch.length; i += 1) {
+                batch[i]!.resolve(rows[i]!);
+              }
+            } catch (batchError) {
+              // Poison-row isolation: retry each insert individually so valid
+              // rows still commit when one coalesced peer is malformed.
+              for (const item of batch) {
+                try {
+                  const row = await this.insertMemoryImmediate(item.input);
+                  item.resolve(row);
+                } catch (rowError) {
+                  item.reject(rowError);
+                }
+              }
+              void batchError;
+            }
+          }
+        } catch (error) {
+          for (const item of batch) {
+            item.reject(error);
+          }
+        }
+        if (this.insertQueue.length > 0) {
+          // Yield between coalesced flushes so large write storms don't monopolize
+          // the event loop for the entire remaining queue (Phase 1.7 mitigation).
+          await new Promise<void>((resolve) => setImmediate(resolve));
         }
       }
-    } catch (error) {
-      for (const item of batch) {
-        item.reject(error);
+    } finally {
+      this.insertFlushInFlight = false;
+      // New items may have arrived while we were finishing; schedule another wave.
+      if (this.insertQueue.length > 0) {
+        this.scheduleInsertFlush();
       }
-    }
-    if (this.insertQueue.length > 0) {
-      void this.flushInsertQueue();
     }
   }
 
@@ -477,7 +429,7 @@ export class SqliteStorageProvider implements StorageProvider {
       }
 
       this.insertEmbedding(row.rowid, input.embedding);
-      // Keep FTS in the same ACID transaction — no deferred/stale keyword search.
+      // Keep FTS in the same ACID transaction ΓÇö no deferred/stale keyword search.
       this.insertFtsRow(
         input.id,
         input.organization,
@@ -497,16 +449,20 @@ export class SqliteStorageProvider implements StorageProvider {
     });
   }
 
-  /** Batch insert memories in chunked multi-row transactions. */
   async insertMemoriesBatch(inputs: InsertMemoryInput[]): Promise<MemoryRow[]> {
     if (inputs.length === 0) {
       return [];
     }
     this.requireVectorReady();
 
-    return this.withTransaction(() => {
+    // One IMMEDIATE TX for atomicity; yield between chunks so large batches
+    // don't monopolize the event loop (Phase 1.7 ΓÇö yielding/chunking strategy).
+    return this.withTransaction(async () => {
       const rows: MemoryRow[] = [];
       for (let offset = 0; offset < inputs.length; offset += BATCH_INSERT_CHUNK) {
+        if (offset > 0) {
+          await new Promise<void>((resolve) => setImmediate(resolve));
+        }
         const chunk = inputs.slice(offset, offset + BATCH_INSERT_CHUNK);
         const inserted = this.insertMemoryChunk(chunk);
         rows.push(...inserted);
@@ -515,7 +471,6 @@ export class SqliteStorageProvider implements StorageProvider {
     });
   }
 
-  /** Update memory content, metadata, embedding, and content hash. */
   async updateMemory(input: UpdateMemoryInput): Promise<MemoryRow | null> {
     const stmts = this.requireStatements();
     return this.withTransaction(() => {
@@ -539,14 +494,44 @@ export class SqliteStorageProvider implements StorageProvider {
             ? hashMemoryContent(input.contentText)
             : (existing.content_hash ?? null);
 
-      stmts.updateMemoryContent.run(
-        input.contentText ?? null,
-        input.metadata !== undefined ? metadataJson : null,
-        contentHash,
-        input.updatedAt,
-        input.id,
-        input.organization,
-      );
+      if (input.expectedVersion !== undefined) {
+        const result = stmts.updateMemoryContentCas.run(
+          input.contentText ?? null,
+          input.metadata !== undefined ? metadataJson : null,
+          contentHash,
+          input.updatedAt,
+          input.id,
+          input.organization,
+          input.expectedVersion,
+        );
+        if (result.changes === 0) {
+          const fresh = stmts.getMemoryById.get(
+            input.id,
+            input.organization,
+          ) as unknown as MemoryRow | undefined;
+          throw new VersionConflictError(
+            `Memory version conflict for ${input.id}: expected ${input.expectedVersion}, actual ${fresh?.row_version ?? "unknown"}`,
+            {
+              memoryId: input.id,
+              expectedVersion: input.expectedVersion,
+              actualVersion: fresh?.row_version,
+              reason: "row_version mismatch",
+              suggestion:
+                "Re-read the memory and retry the update with the current version.",
+              operation: "updateMemory",
+            },
+          );
+        }
+      } else {
+        stmts.updateMemoryContent.run(
+          input.contentText ?? null,
+          input.metadata !== undefined ? metadataJson : null,
+          contentHash,
+          input.updatedAt,
+          input.id,
+          input.organization,
+        );
+      }
 
       if (input.embedding) {
         this.deleteEmbedding(existing.rowid);
@@ -574,7 +559,6 @@ export class SqliteStorageProvider implements StorageProvider {
     });
   }
 
-  /** Find an active memory by org, agent, and content hash (dedupe). */
   async findActiveByContentHash(
     organization: string,
     agent: string,
@@ -589,7 +573,6 @@ export class SqliteStorageProvider implements StorageProvider {
     return row ?? null;
   }
 
-  /** Scan memories matching metadata filters (may paginate in SQL). */
   async searchByMetadata(
     filter: RepositoryFilter,
     limit?: number,
@@ -604,7 +587,6 @@ export class SqliteStorageProvider implements StorageProvider {
   }
 
   /** Keyword search via FTS5 BM25. Returns memory IDs ranked by relevance. */
-  /** BM25 keyword search via FTS5 (`memories_fts`). */
   async searchKeyword(
     query: string,
     organization: string,
@@ -631,7 +613,7 @@ export class SqliteStorageProvider implements StorageProvider {
       }>;
       return rows.map((row) => ({
         memoryId: row.memory_id,
-        // bm25 returns lower (more negative) for better matches — invert to [0, ∞)
+        // bm25 returns lower (more negative) for better matches ΓÇö invert to [0, Γê₧)
         score: 1 / (1 + Math.abs(row.rank)),
       }));
     } catch (error) {
@@ -648,7 +630,6 @@ export class SqliteStorageProvider implements StorageProvider {
     }
   }
 
-  /** Fetch a memory row by UUID within an organization. */
   async getMemoryById(
     id: string,
     organization: string,
@@ -660,7 +641,6 @@ export class SqliteStorageProvider implements StorageProvider {
     return row ?? null;
   }
 
-  /** Fetch a memory row by SQLite integer rowid within an organization. */
   async getMemoryByRowid(
     rowid: number,
     organization: string,
@@ -672,7 +652,6 @@ export class SqliteStorageProvider implements StorageProvider {
     return row ?? null;
   }
 
-  /** Batch-fetch memory rows by SQLite rowids within an organization. */
   async getMemoriesByRowids(
     rowids: number[],
     organization: string,
@@ -695,7 +674,6 @@ export class SqliteStorageProvider implements StorageProvider {
     return out;
   }
 
-  /** List memories matching repository filters with optional limit. */
   async listMemories(
     filter: RepositoryFilter,
     limit?: number,
@@ -712,7 +690,6 @@ export class SqliteStorageProvider implements StorageProvider {
     }
   }
 
-  /** Approximate nearest-neighbor search (vec0 or in-memory blob index). */
   async searchVectors(
     embedding: Float32Array,
     topK: number,
@@ -729,7 +706,6 @@ export class SqliteStorageProvider implements StorageProvider {
    * Org-scoped KNN + memory rows with adaptive overfetch.
    * Global ANN is post-filtered by org/agent/archived; underfill triggers larger k.
    */
-  /** ANN search joined with memory rows and org/archived post-filters. */
   async searchVectorsWithMemories(
     embedding: Float32Array,
     topK: number,
@@ -776,7 +752,6 @@ export class SqliteStorageProvider implements StorageProvider {
     return out;
   }
 
-  /** Soft-archive memories (compression / forget paths). */
   async archiveMemories(
     ids: string[],
     organization: string,
@@ -787,8 +762,7 @@ export class SqliteStorageProvider implements StorageProvider {
     const archived: string[] = [];
 
     return this.withTransaction(() => {
-      const orderedIds = [...new Set(ids)].sort();
-      for (const id of orderedIds) {
+      for (const id of ids) {
         const existing = stmts.getMemoryById.get(id, organization) as unknown as
           | MemoryRow
           | undefined;
@@ -825,7 +799,6 @@ export class SqliteStorageProvider implements StorageProvider {
     });
   }
 
-  /** Hard-delete a single memory by id; returns whether a row was removed. */
   async deleteMemoryById(id: string, organization: string): Promise<boolean> {
     const stmts = this.requireStatements();
 
@@ -844,7 +817,6 @@ export class SqliteStorageProvider implements StorageProvider {
     });
   }
 
-  /** Hard-delete memories matching org / agent / metadata filters. */
   async deleteMemoriesByFilter(filter: RepositoryFilter): Promise<number> {
     const stmts = this.requireStatements();
     const agent = filter.agent;
@@ -863,7 +835,6 @@ export class SqliteStorageProvider implements StorageProvider {
     });
   }
 
-  /** Remove all memories (and side tables) for an organization. */
   async clearOrganization(organization: string): Promise<number> {
     const stmts = this.requireStatements();
 
@@ -884,13 +855,11 @@ export class SqliteStorageProvider implements StorageProvider {
     });
   }
 
-  /** List audit history events for a memory id. */
   async getHistory(memoryId: string): Promise<HistoryRow[]> {
     const stmts = this.requireStatements();
     return stmts.getHistory.all(memoryId) as unknown as HistoryRow[];
   }
 
-  /** Append a history row (created / archived / compressed / updated). */
   async insertHistoryEvent(event: HistoryRow): Promise<void> {
     const stmts = this.requireStatements();
     stmts.insertHistory.run(
@@ -902,7 +871,6 @@ export class SqliteStorageProvider implements StorageProvider {
     );
   }
 
-  /** Aggregate memory counts for an organization (single-pass SQL). */
   async getStats(
     organization: string,
   ): Promise<{
@@ -926,7 +894,6 @@ export class SqliteStorageProvider implements StorageProvider {
     };
   }
 
-  /** On-disk database file size in bytes (0 for `:memory:`). */
   async getDatabaseSizeBytes(): Promise<number> {
     const db = this.requireDb();
     if (this.connectionString === ":memory:") {
@@ -965,12 +932,10 @@ export class SqliteStorageProvider implements StorageProvider {
 
   async withTransaction<T>(fn: () => T | Promise<T>): Promise<T> {
     const db = this.requireDb();
-    // Genuine synchronous nesting inside an already-held transaction on this
-    // connection (e.g. compress() -> insertMemory()/archiveMemories()).
+    // Nested writes can happen (e.g. compress() wrapping storage.withTransaction()
+    // while provider methods also use withTransaction internally).
     // SQLite forbids BEGIN/COMMIT inside a transaction, so we use SAVEPOINTs.
-    // We DON'T re-acquire the write mutex here: the outer top-level tx already
-    // holds it, so re-acquiring would self-deadlock.
-    if (this.txContext.getStore() === true) {
+    if (this.transactionDepth > 0) {
       const savepointName = `wolbarg_sp_${this.savepointCounter++}`;
       db.exec(`SAVEPOINT ${savepointName}`);
       try {
@@ -990,34 +955,27 @@ export class SqliteStorageProvider implements StorageProvider {
       }
     }
 
-    // Top-level transaction: serialize on the connection so no two BEGIN
-    // IMMEDIATE / SAVEPOINT sequences ever interleave on the shared handle.
-    return this.writeMutex.runExclusive(() =>
-      this.txContext.run(true, async () => {
-        this.transactionDepth = 1;
-        this.savepointCounter = 0;
-        try {
-          return await withImmediateTransaction(
-            db,
-            this.concurrency,
-            fn,
-            (attempt, delayMs) => {
-              this.retryLog?.(
-                `SQLITE_BUSY retry attempt=${attempt} backoffMs=${Math.round(delayMs)}`,
-              );
-            },
+    this.transactionDepth = 1;
+    try {
+      return await withImmediateTransaction(
+        db,
+        this.concurrency,
+        fn,
+        (attempt, delayMs) => {
+          this.retryLog?.(
+            `SQLITE_BUSY retry attempt=${attempt} backoffMs=${Math.round(delayMs)}`,
           );
-        } finally {
-          this.transactionDepth = 0;
-        }
-      }),
-    );
+        },
+      );
+    } finally {
+      this.transactionDepth = 0;
+    }
   }
 
-  // ─── internals ───────────────────────────────────────────────────────────
+  // ΓöÇΓöÇΓöÇ internals ΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇ
 
   private tryLoadSqliteVec(db: DatabaseSync): boolean {
-    // win32-arm64 (and similar) cannot load sqlite-vec — skip the failed
+    // win32-arm64 (and similar) cannot load sqlite-vec ΓÇö skip the failed
     // load attempt on every open (saves cold-start ms).
     const plat = `${process.platform}-${process.arch}`;
     if (SqliteStorageProvider.sqliteVecUnsupported.has(plat)) {
@@ -1067,6 +1025,9 @@ export class SqliteStorageProvider implements StorageProvider {
       if (current < 4) {
         this.migrateToV4(db);
       }
+      if (current < 5) {
+        this.migrateToV5(db);
+      }
       for (const indexSql of CREATE_INDEXES) {
         db.exec(indexSql);
       }
@@ -1099,9 +1060,22 @@ export class SqliteStorageProvider implements StorageProvider {
     this.memoryIndexDirty = true;
   }
 
+  /** Schema v5: optimistic concurrency `row_version` column. */
+  private migrateToV5(db: DatabaseSync): void {
+    const cols = db
+      .prepare(`PRAGMA table_info(memories)`)
+      .all() as unknown as Array<{ name: string }>;
+    const hasVersion = cols.some((c) => c.name === "row_version");
+    if (!hasVersion) {
+      db.exec(
+        `ALTER TABLE memories ADD COLUMN row_version INTEGER NOT NULL DEFAULT 1`,
+      );
+    }
+  }
+
   /**
    * Schema v3: content_hash column, history 'updated' event, embedding_cache.
-   * SQLite cannot ALTER CHECK constraints — rebuild memory_history when needed.
+   * SQLite cannot ALTER CHECK constraints ΓÇö rebuild memory_history when needed.
    */
   private migrateToV3(db: DatabaseSync): void {
     // Add content_hash if missing
@@ -1129,7 +1103,7 @@ export class SqliteStorageProvider implements StorageProvider {
     );
     for (const row of active) {
       const hash = hashMemoryContent(row.content_text);
-      // Scope uniqueness is (org, agent, hash) — we only have id here; full
+      // Scope uniqueness is (org, agent, hash) ΓÇö we only have id here; full
       // uniqueness is enforced after org/agent-aware backfill below.
       updateHash.run(hash, row.id);
     }
@@ -1213,7 +1187,7 @@ export class SqliteStorageProvider implements StorageProvider {
         this.backfillFts(db);
       }
     } catch {
-      // FTS unavailable — keyword search degrades gracefully.
+      // FTS unavailable ΓÇö keyword search degrades gracefully.
     }
   }
 
@@ -1235,7 +1209,7 @@ export class SqliteStorageProvider implements StorageProvider {
         insert.run(row.content_text, row.id, row.organization, row.agent);
       }
     } catch {
-      // FTS may be unavailable on exotic builds — keyword search degrades.
+      // FTS may be unavailable on exotic builds ΓÇö keyword search degrades.
     }
   }
 
@@ -1279,6 +1253,7 @@ export class SqliteStorageProvider implements StorageProvider {
       setMeta: db.prepare(SQL.setMeta),
       insertMemory: db.prepare(SQL.insertMemory),
       updateMemoryContent: db.prepare(SQL.updateMemoryContent),
+      updateMemoryContentCas: db.prepare(SQL.updateMemoryContentCas),
       getMemoryById: db.prepare(SQL.getMemoryById),
       getMemoryByRowid: db.prepare(SQL.getMemoryByRowid),
       findActiveByContentHash: db.prepare(SQL.findActiveByContentHash),
@@ -1533,7 +1508,7 @@ export class SqliteStorageProvider implements StorageProvider {
       }
     }
 
-    // Multi-row side tables — one statement each instead of 3N run() calls.
+    // Multi-row side tables ΓÇö one statement each instead of 3N run() calls.
     this.insertEmbeddingsBatch(rows, inputs);
     this.insertFtsBatch(inputs);
     this.insertHistoryBatch(inputs);
@@ -1694,7 +1669,7 @@ export class SqliteStorageProvider implements StorageProvider {
     try {
       stmts.insertFts.run(contentText, memoryId, organization, agent);
     } catch {
-      // ignore FTS errors — keyword search degrades but semantic search remains
+      // ignore FTS errors ΓÇö keyword search degrades but semantic search remains
     }
   }
 
@@ -1712,7 +1687,7 @@ export class SqliteStorageProvider implements StorageProvider {
       stmts.deleteFts.run(memoryId);
       stmts.insertFts.run(contentText, memoryId, organization, agent);
     } catch {
-      // ignore FTS errors — keyword search degrades but semantic search remains
+      // ignore FTS errors ΓÇö keyword search degrades but semantic search remains
     }
   }
 
@@ -1822,7 +1797,7 @@ export class SqliteStorageProvider implements StorageProvider {
     }
     const id = Number(rowid);
     stmts.insertEmbeddingBlob!.run(id, embeddingToBuffer(embedding));
-    // Keep the hot in-memory ANN index incremental — avoid O(n) rebuilds.
+    // Keep the hot in-memory ANN index incremental ΓÇö avoid O(n) rebuilds.
     if (this.memoryIndex) {
       this.memoryIndex.upsert(id, embedding);
       this.memoryIndexDirty = false;

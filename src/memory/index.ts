@@ -23,6 +23,7 @@ export function toMemoryRecord(row: MemoryRow): MemoryRecord {
     metadata: deserializeMetadata(row.metadata_json),
     archived: row.archived === 1,
     compressedInto: row.compressed_into,
+    version: row.row_version ?? 1,
     createdAt: parseIso(row.created_at),
     updatedAt: parseIso(row.updated_at),
   };

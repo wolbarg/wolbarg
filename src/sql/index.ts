@@ -1,10 +1,7 @@
 /**
  * Prepared-statement SQL templates for the SQLite provider.
- *
- * Each property is a parameterized query string consumed by
- * {@link SqliteStorageProvider} — not a public runtime API, but exported
- * for tests, tooling, and custom SQLite adapters.
  */
+
 export const SQL = {
   getMeta: `SELECT value FROM Wolbarg_meta WHERE key = ?`,
   setMeta: `
@@ -18,26 +15,26 @@ export const SQL = {
       archived, compressed_into, content_hash, created_at, updated_at
     ) VALUES (?, ?, ?, ?, ?, 0, NULL, ?, ?, ?)
     RETURNING rowid, id, organization, agent, content_text, metadata_json,
-              archived, compressed_into, content_hash, created_at, updated_at
+              archived, compressed_into, content_hash, row_version, created_at, updated_at
   `,
 
   getMemoryById: `
     SELECT rowid, id, organization, agent, content_text, metadata_json,
-           archived, compressed_into, content_hash, created_at, updated_at
+           archived, compressed_into, content_hash, row_version, created_at, updated_at
     FROM memories
     WHERE id = ? AND organization = ?
   `,
 
   getMemoryByRowid: `
     SELECT rowid, id, organization, agent, content_text, metadata_json,
-           archived, compressed_into, content_hash, created_at, updated_at
+           archived, compressed_into, content_hash, row_version, created_at, updated_at
     FROM memories
     WHERE rowid = ? AND organization = ?
   `,
 
   getMemoriesByRowidsPrefix: `
     SELECT rowid, id, organization, agent, content_text, metadata_json,
-           archived, compressed_into, content_hash, created_at, updated_at
+           archived, compressed_into, content_hash, row_version, created_at, updated_at
     FROM memories
     WHERE organization = ? AND rowid IN (
   `,
@@ -160,8 +157,19 @@ export const SQL = {
     SET content_text = COALESCE(?, content_text),
         metadata_json = COALESCE(?, metadata_json),
         content_hash = COALESCE(?, content_hash),
-        updated_at = ?
+        updated_at = ?,
+        row_version = row_version + 1
     WHERE id = ? AND organization = ?
+  `,
+
+  updateMemoryContentCas: `
+    UPDATE memories
+    SET content_text = COALESCE(?, content_text),
+        metadata_json = COALESCE(?, metadata_json),
+        content_hash = COALESCE(?, content_hash),
+        updated_at = ?,
+        row_version = row_version + 1
+    WHERE id = ? AND organization = ? AND row_version = ?
   `,
 
   insertFts: `

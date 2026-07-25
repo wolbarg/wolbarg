@@ -11,6 +11,21 @@ jobs:
     name: typecheck · test · build
     runs-on: ubuntu-latest
 
+    services:
+      postgres:
+        image: pgvector/pgvector:pg16
+        env:
+          POSTGRES_USER: wolbarg
+          POSTGRES_PASSWORD: wolbarg
+          POSTGRES_DB: wolbarg_test
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U wolbarg -d wolbarg_test"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
+
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -28,8 +43,10 @@ jobs:
       - name: Typecheck
         run: npm run typecheck
 
-      - name: Test
-        run: npm test
-
       - name: Build
         run: npm run build
+
+      - name: Test (SQLite + live Postgres)
+        env:
+          WOLBARG_TEST_DATABASE_URL: postgresql://wolbarg:wolbarg@localhost:5432/wolbarg_test
+        run: npm test
