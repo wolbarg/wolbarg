@@ -1,0 +1,18 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 280 48" role="img" aria-label="wolbarg">
+  <title>wolbarg</title>
+  <style>
+    .wordmark {
+      fill: #0a0a0a;
+      font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono", "Courier New", monospace;
+      font-size: 42px;
+      font-weight: 700;
+      letter-spacing: -0.04em;
+    }
+    @media (prefers-color-scheme: dark) {
+      .wordmark {
+        fill: #f5f5f5;
+      }
+    }
+  </style>
+  <text class="wordmark" x="140" y="36" text-anchor="middle">wolbarg</text>
+</svg>

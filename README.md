@@ -1,12 +1,12 @@
 <p align="center">
-  <img src="./assets/wolbarg-mark.png" alt="Wolbarg" width="72" height="72" />
+  <img src="./assets/wolbarg-mark.png" alt="Wolbarg" width="76" height="76" align="absmiddle"  />
+  &nbsp;&nbsp;
+  <img src="./assets/wolbarg-name.svg" alt="wolbarg" height="36" align="absmiddle" />
 </p>
 
-<h1 align="center">wolbarg</h1>
 <p align="center">
   <b>Modular, provider-agnostic semantic memory for AI agents.</b>
 </p>
-
 <p align="center">
   <a href="https://www.npmjs.com/package/wolbarg"><img alt="npm version" src="https://img.shields.io/npm/v/wolbarg.svg" /></a>
   <a href="./LICENSE"><img alt="License: MIT" src="https://img.shields.io/badge/license-MIT-green.svg" /></a>
