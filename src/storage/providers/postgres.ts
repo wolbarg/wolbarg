@@ -20,6 +20,7 @@ import {
   InitializationError,
   ConfigurationError,
   VersionConflictError,
+  WolbargError,
 } from "../../errors/index.js";
 import { matchesMetadata } from "../../filters/match.js";
 import { compileMetadataFilterToPostgres } from "../../filters/sql-compile-postgres.js";
@@ -1445,7 +1446,9 @@ export class PostgresStorageProvider implements StorageProvider {
     } catch (error) {
       this.pendingNotifies.length = 0;
       await client.query("ROLLBACK").catch(() => undefined);
-      if (error instanceof DatabaseError || error instanceof InitializationError) {
+      // Preserve typed SDK errors (VersionConflictError, DatabaseError, …)
+      // so callers can use instanceof after withWriteLock/withTransaction.
+      if (error instanceof WolbargError) {
         throw error;
       }
       throw new DatabaseError(`Transaction failed: ${this.describe(error)}`, {
