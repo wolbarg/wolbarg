@@ -1,7 +1,10 @@
 <p align="center">
-  <img src="./assets/wolbarg-mark.png" alt="Wolbarg" width="76" height="76" align="absmiddle"  />
-  &nbsp;&nbsp;
-  <img src="./assets/wolbarg-name.svg" alt="wolbarg" height="36" align="absmiddle" />
+  <img src="./assets/wolbarg-icon.png" alt="Wolbarg" width="96" height="96" align="absmiddle" />
+  &nbsp;&nbsp;&nbsp;
+  <picture>
+    <source media="(prefers-color-scheme: dark)" srcset="./assets/wolbarg-name-dark.png" />
+    <img src="./assets/wolbarg-name-light.png" alt="wolbarg" height="46" align="absmiddle" />
+  </picture>
 </p>
 
 <p align="center">
