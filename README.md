@@ -1,353 +1,101 @@
-![Wolbarg — Memory Infrastructure for AI Agents](./assets/wolbarg-banner.png)
+<p align="center">
+  <img src="./assets/wolbarg-mark.png" alt="Wolbarg" width="72" height="72" />
+</p>
 
-# Wolbarg
+<h1 align="center">wolbarg</h1>
+<p align="center">
+  <b>Modular, provider-agnostic semantic memory for AI agents.</b>
+</p>
 
-**Modular, provider-agnostic semantic memory for AI agents.**
+<p align="center">
+  <a href="https://www.npmjs.com/package/wolbarg"><img alt="npm version" src="https://img.shields.io/npm/v/wolbarg.svg" /></a>
+  <a href="./LICENSE"><img alt="License: MIT" src="https://img.shields.io/badge/license-MIT-green.svg" /></a>
+  <a href="https://nodejs.org"><img alt="Node.js" src="https://img.shields.io/badge/node-%3E%3D22.5-brightgreen.svg" /></a>
+  <a href="https://wolbarg.com/docs/quick-start"><img alt="Docs" src="https://img.shields.io/badge/docs-wolbarg.com-black" /></a>
+  <a href="https://wolbarg.com/benchmarks"><img alt="Benchmarks" src="https://img.shields.io/badge/benchmarks-wolbarg.com-black" /></a>
+  <a href="https://github.com/wolbarg/wolbarg/actions/workflows/sdk-ci.yml"><img alt="SDK CI" src="https://github.com/wolbarg/wolbarg/actions/workflows/sdk-ci.yml/badge.svg?branch=main" /></a>
+</p>
 
-[![npm version](https://img.shields.io/npm/v/wolbarg.svg)](https://www.npmjs.com/package/wolbarg)
-[![SDK CI](https://github.com/wolbarg/wolbarg/actions/workflows/sdk-ci.yml/badge.svg?branch=main)](https://github.com/wolbarg/wolbarg/actions/workflows/sdk-ci.yml)
-[![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](./LICENSE)
-[![Node.js](https://img.shields.io/badge/node-%3E%3D22.5-brightgreen.svg)](https://nodejs.org)
-[![Docs](https://img.shields.io/badge/docs-wolbarg.com-black)](https://wolbarg.com)
-[![Benchmarks](https://img.shields.io/badge/benchmarks-v0.4%20stress-black)](https://wolbarg.com/benchmarks)
+Wolbarg is **memory infrastructure**, not an agent framework. Agents call `remember()` / `recall()` against durable semantic memory on your disk or Postgres — with optional ingest, graph links, hybrid search, and [Wolbarg Studio](https://wolbarg.com/docs/observability) for observability. You bring any OpenAI-compatible embedding API.
 
-```bash
-npm install wolbarg
-```
+> [!TIP]
+> No API key needed to try it — point embeddings at local [Ollama](https://ollama.com) below. For projects, run `npx wolbarg init` and use `createWolbargFromProjectConfig()` — see the [Quick Start](https://wolbarg.com/docs/quick-start).
 
-### Configure with the CLI (recommended)
-
-```bash
-npx wolbarg init
-```
-
-You will be prompted (all optional — Enter accepts defaults):
-
-1. **Database** — default `.wolbarg/shared-memory/memory.db` (or a Postgres URL)
-2. **Embedding provider** — OpenAI, Ollama, OpenRouter, LM Studio, Gemini, Together, vLLM, or custom
-3. **Base URL** — always shown with that provider’s default (edit or keep)
-4. **Model** — provider default pre-filled
-5. **API key** — written to `.wolbarg/.env` (not into config JSON)
-
-Non-interactive:
-
-```bash
-npx wolbarg init --yes --provider openai --api-key "$OPENAI_API_KEY"
-npx wolbarg init --yes --skip-embedding
-```
-
-Then in code:
-
-```ts
-import { createWolbargFromProjectConfig } from "wolbarg";
-
-const ctx = createWolbargFromProjectConfig();
-await ctx.ready();
-```
-
-Wolbarg is **memory infrastructure**, not an agent framework. Agents call `remember()` / `recall()` (and optionally ingest, compress, subscribe, and link memories in a graph). You bring SQLite or PostgreSQL, any OpenAI-compatible embedding API, and optional peers for PDF/DOCX/OCR/Neo4j.
-
-**Current release: [v0.5.6](./CHANGELOG.md)** — `wolbarg init` CLI + project config loader. Still includes official framework adapters (`@wolbarg/openai`, `@wolbarg/langchain`, `@wolbarg/llamaindex`, `@wolbarg/mastra`, `@wolbarg/vercel-ai`), experimental `rememberFromMessages()`, 0.5 graph memory (SQLite + Neo4j), `includeGraph` recall, and [Wolbarg Studio](https://wolbarg.com/docs/observability).
-
----
-
-## Why Wolbarg?
-
-| Problem | What Wolbarg does |
-| --- | --- |
-| Agents forget between sessions | Durable semantic memory on **your** disk or Postgres |
-| Vendor lock-in | Pluggable embeddings, LLM, rerankers, OCR, vision, storage, graph |
-| Vectors alone are not enough | Hybrid search (semantic + BM25), metadata filters, MMR, optional rerank |
-| Multi-agent writes collide | SQLite `BEGIN IMMEDIATE` + retries; Postgres row-level locking |
-| Duplicate facts pile up | Opt-in write-time dedupe / upsert |
-| Repeated embeds cost money | Transparent embedding cache (default on) |
-| Need structure, not only similarity | Optional **graph** — `linkMemories` / `getRelated` (SQLite ↔ Neo4j) |
-| Hard to debug memory | Telemetry + **Wolbarg Studio** (local, read-only) |
-
----
-
-## Features
-
-- **Storage** — SQLite (`node:sqlite` + sqlite-vec) or PostgreSQL (+ optional pgvector)
-- **Recall** — semantic, hybrid, metadata filters, MMR, rerank, `explain: true`
-- **Ingest** — text / markdown / PDF / DOCX / images (peers for PDF/DOCX/OCR)
-- **Compress** — optional LLM summarization with archive lineage
-- **`subscribe()`** — real-time change events (SQLite in-process; Postgres LISTEN/NOTIFY)
-- **Concurrency** — multi-writer SQLite hardening (`WOLBARG_STORAGE_LOCKED`)
-- **Embedding cache** — `hash(content) + model`
-- **Dedupe / upsert** — opt-in exact / near / exact-or-near
-- **Graph memory (0.5)** — `sqliteGraph` / `neo4jGraph`, `linkMemories`, `getRelated`, `includeGraph`
-- **Conversation bridge (0.5.2, experimental)** — `rememberFromMessages()` raw or LLM extract
-- **Framework adapter** — official [`@wolbarg/vercel-ai`](../packages/vercel-ai/) middleware (`wrapLanguageModel`)
-- **Checkpoints / export** — file-backed SQLite snapshots (+ graph file when applicable)
-- **Telemetry** — independent event DB; Studio dashboard, Trace Explorer, graph canvas
-
-Docs: [Getting started](https://wolbarg.com/docs/getting-started) · [Vercel AI](https://wolbarg.com/docs/integrations/vercel-ai) · [rememberFromMessages](https://wolbarg.com/docs/api/remember-from-messages) · [Graph memory](https://wolbarg.com/docs/graph-memory) · [Studio](https://wolbarg.com/docs/observability)
-
----
-
-## Benchmarks (v0.4.0 stress · mock embeddings)
-
-Published dual-backend **v4-stress** suite (2026-07-18 · Node v24.13.1 · win32/arm64 · 8 CPUs). Mock embeddings isolate SDK + database cost — not LIVE provider latency.
-
-### Headlines
-
-| Metric | SQLite | PostgreSQL |
-| --- | --- | --- |
-| Cold `ready()` | **16.18 ms** | **91.39 ms** |
-| Batch remember (200) | **5,795 ops/s** | **2,795 ops/s** |
-| Bulk insert 2k | **7,509 ops/s** | **4,085 ops/s** |
-| Recall p95 @ 2k | **4.83 ms** | **141.5 ms** |
-| 16 writers throughput | **8,660 ops/s** | **3,335 ops/s** |
-| Embedding cache speedup | **1.47×** | **1.18×** |
-| Suite result | 25 pass / 0 fail | 21 pass / 0 fail / 4 skip\* |
-
-\*Postgres skips SQLite-only paths (telemetry EventDatabase, file checkpoints, export/import).
-
-### SQLite — stress & concurrency
-
-| Case | Result |
-| --- | --- |
-| Bulk insert 2k + search | 7,509 insert ops/s · recall p50 **4.12 ms** · p95 **4.83 ms** |
-| 8 writers × 20 ops | **6,084** ops/s · p95 **3.05 ms** · 0 failures |
-| 16 writers × 20 ops | **8,660** ops/s · p95 **2.46 ms** · 0 failures |
-| 32 writers × 20 ops | **6,798** ops/s · p95 **22.94 ms** · 0 failures |
-| Mixed read/write storm | 0 failures |
-
-### PostgreSQL — stress & concurrency
-
-| Case | Result |
-| --- | --- |
-| Bulk insert 2k + search | 4,085 insert ops/s · recall p50 **23.29 ms** · p95 **141.5 ms** |
-| 8 writers × 20 ops | **2,555** ops/s · p95 **8.51 ms** · 0 failures |
-| 16 writers × 20 ops | **3,335** ops/s · p95 **9.48 ms** · 0 failures |
-| 32 writers × 20 ops | **3,802** ops/s · p95 **14.77 ms** · 0 failures |
-| Mixed read/write storm | 0 failures |
-
-**Artifacts:** [SQLite JSON](https://wolbarg.com/benchmarks/version-0.4.0-sqlite-benchmark.json) · [SQLite MD](https://wolbarg.com/benchmarks/version-0.4.0-sqlite-benchmark.md) · [Postgres JSON](https://wolbarg.com/benchmarks/version-0.4.0-postgres-benchmark.json) · [Postgres MD](https://wolbarg.com/benchmarks/version-0.4.0-postgres-benchmark.md) · [Interactive page](https://wolbarg.com/benchmarks) · [Methodology](https://wolbarg.com/docs/benchmarks)
-
-Also published: [embedding-cache](https://wolbarg.com/benchmarks/embedding-cache.json) · [multiprocess concurrency](https://wolbarg.com/benchmarks/multiprocess-concurrency.json)
-
----
-
-## Installation
+## Quickstart
 
 ```bash
 npm install wolbarg
-# or: pnpm add wolbarg · yarn add wolbarg · bun add wolbarg
+ollama pull nomic-embed-text
 ```
-
-**Requires Node.js 22.5+** (built-in `node:sqlite`).
-
-### Optional peers
-
-Install only what you use:
-
-| Peer | Required for |
-| --- | --- |
-| `pg` | PostgreSQL storage |
-| `neo4j-driver` | `neo4jGraph(...)` |
-| `pdf-parse@1.1.4` | PDF ingest |
-| `mammoth` | DOCX ingest |
-| `tesseract.js` | OCR |
-
-```bash
-npm install pg neo4j-driver          # production storage + graph
-npm install pdf-parse@1.1.4 mammoth  # document ingest
-```
-
-Peers are **not** bundled. Missing peers fail at use time for that path — not at import. Plain `.txt` / `.md` / `.csv` / `.json` and SQLite graph need no extras.
-
----
-
-## Quick start
 
 ```ts
-import { wolbarg, openaiEmbedding, openaiLlm, bm25 } from "wolbarg";
+import { wolbarg, sqlite, openaiEmbedding } from "wolbarg";
 
 const ctx = wolbarg({
-  organization: "my-org",
-  database: { provider: "sqlite", url: "./memory.db" },
+  organization: "demo",
+  storage: sqlite("./memory.db"),
   embedding: openaiEmbedding({
-    apiKey: process.env.OPENAI_API_KEY!,
-    model: "text-embedding-3-small",
+    baseUrl: "http://localhost:11434/v1",
+    apiKey: "ollama",
+    model: "nomic-embed-text",
   }),
-  llm: openaiLlm({
-    apiKey: process.env.OPENAI_API_KEY!,
-    model: "gpt-4.1-mini",
-  }),
-  keywordSearch: bm25(),
-  concurrency: { maxRetries: 5 },
-  embeddingCache: { enabled: true },
-  memory: { dedupe: { enabled: true, strategy: "exact-or-near" } },
-  telemetry: {
-    enabled: true,
-    database: { provider: "sqlite", url: "./telemetry.db" },
-    level: "debug",
-  },
 });
 
 await ctx.ready();
-
-const saved = await ctx.remember({
-  agent: "research",
+await ctx.remember({
+  agent: "demo",
   content: { text: "Stripe supports recurring invoices." },
-  metadata: { topic: "billing" },
 });
-// saved.action === "created" | "updated"
-
-const hits = await ctx.recall({
-  query: "How do recurring invoices work?",
-  topK: 5,
-  hybrid: true,
-});
-
-ctx.subscribe({ organization: "my-org" }, (e) => {
-  console.log(e.event, e.memoryId);
-});
-
-await ctx.checkpoint("before-compress");
+const hits = await ctx.recall({ query: "How do recurring invoices work?" });
+console.log(hits[0].content.text);
 await ctx.close();
 ```
 
-### Graph memory (0.5)
+That's the loop: `remember()` writes it, `recall()` finds it by meaning. Swap the embedding config for OpenAI, Gemini, or anything OpenAI-compatible when you're ready for production — nothing else in your code changes.
 
-Same typed API locally and in production — swap only the factory:
+Requires **Node.js 22.5+**. Optional peers (`pg`, `neo4j-driver`, PDF/DOCX/OCR) — [Installation](https://wolbarg.com/docs/installation).
 
-```ts
-import { wolbarg, openaiEmbedding, sqliteGraph, neo4jGraph } from "wolbarg";
+## Wolbarg ecosystem
 
-// Local
-graph: sqliteGraph({ path: "./graph.db" })
+Use the core SDK alone, or plug into the tools around it:
 
-// Production
-graph: neo4jGraph({
-  url: process.env.NEO4J_URL!,
-  username: process.env.NEO4J_USER!,
-  password: process.env.NEO4J_PASSWORD!,
-})
-```
+- **[Docs](https://wolbarg.com/docs/quick-start)** — quick start, configuration, API reference
+- **[@wolbarg/vercel-ai](https://wolbarg.com/docs/integrations/vercel-ai)** — Vercel AI SDK middleware (`wrapLanguageModel`)
+- **[@wolbarg/openai](https://wolbarg.com/docs/integrations/openai)** — OpenAI Agents SDK session
+- **[@wolbarg/langchain](https://wolbarg.com/docs/integrations/langchain)** — LangChain / LangGraph memory
+- **[@wolbarg/llamaindex](https://wolbarg.com/docs/integrations/llamaindex)** — LlamaIndexTS memory block
+- **[@wolbarg/mastra](https://wolbarg.com/docs/integrations/mastra)** — Mastra processor
+- **[Cursor plugin](https://wolbarg.com/docs/connectors/cursor)** — shared memory for Cursor agents
+- **[Wolbarg Studio](https://wolbarg.com/docs/observability)** — local telemetry dashboard, Trace Explorer, graph canvas
+- **[Benchmarks](https://wolbarg.com/benchmarks)** — published SQLite / Postgres stress results
 
-```ts
-const a = await ctx.remember({
-  agent: "support",
-  content: { text: "Refunds take 5 business days." },
-});
-const b = await ctx.remember({
-  agent: "support",
-  content: { text: "Chargebacks escalate to risk." },
-});
+## Why use Wolbarg?
 
-await ctx.linkMemories(a.id, b.id, "related_to");
-const related = await ctx.getRelated(a.id, { depth: 1 });
+Most agent stacks either bolt memory onto a chat transcript or lock you into a hosted vector database. Wolbarg sits in between: a **shared semantic memory layer** you own, with a small public API and replaceable backends.
 
-const withGraph = await ctx.recall({
-  query: "refunds",
-  includeGraph: true,
-});
-// withGraph[0].related — neighbors from the graph
-```
-
-Guide: [Graph memory](https://wolbarg.com/docs/graph-memory) · Prefer a [provider-isolated project layout](https://wolbarg.com/docs/installation#project-layout) so backend swaps stay one-file.
-
-### Constructor DI (still supported)
-
-```ts
-import { Wolbarg, sqlite, openaiEmbedding } from "wolbarg";
-
-const ctx = new Wolbarg({
-  organization: "my-org",
-  storage: sqlite("./memory.db"),
-  embedding: openaiEmbedding({
-    apiKey: process.env.OPENAI_API_KEY!,
-    model: "text-embedding-3-small",
-  }),
-});
-```
-
-**Required:** `organization`, `storage` or `database`, `embedding`.  
-**Optional:** `llm`, `keywordSearch`, `reranker`, `ocr`, `vision`, `chunking`, `telemetry`, `concurrency`, `embeddingCache`, `memory.dedupe`, `graph`, `checkpoint` / `checkpointDirectory`.
+- **Agents that forget between sessions** — Durable memory on your SQLite file or Postgres. Facts survive restarts, redeploys, and new agent runs — not trapped in a single conversation window.
+- **No vendor lock-in** — Pluggable embeddings, LLM, rerankers, OCR, vision, storage, and graph. Swap OpenAI ↔ Ollama or SQLite ↔ Postgres by changing a factory, not your agent logic.
+- **Vectors alone are not enough** — Hybrid search (semantic + BM25), metadata filters, MMR, and optional rerank so recall matches how agents actually ask questions.
+- **Multi-agent writes collide** — SQLite hardened with `BEGIN IMMEDIATE` + retries (`WOLBARG_STORAGE_LOCKED` when exhausted); Postgres uses row-level locking. Built for parallel writers, not single-process demos.
+- **Duplicate facts pile up** — Opt-in write-time dedupe / upsert so restated preferences update instead of flooding the store.
+- **Repeated embeds cost money** — Transparent embedding cache keyed by `hash(content) + model` (on by default) cuts provider calls on repeated text.
+- **Need structure, not only similarity** — Optional [graph memory](https://wolbarg.com/docs/graph-memory): `linkMemories` / `getRelated` / `includeGraph` on recall, with the same typed API for local SQLite graph and production Neo4j.
+- **Hard to debug memory** — Independent telemetry DB plus [Wolbarg Studio](https://wolbarg.com/docs/observability) (dashboard, Trace Explorer, graph canvas) so you can see what was remembered and how recall ranked it.
 
 ---
 
-## API surface
+## Resources
 
-| Method | Role |
-| --- | --- |
-| `remember` / `rememberBatch` | Embed + store (`RememberResult` includes `action`) |
-| `update` | Edit an existing memory by id |
-| `recall` / `recallBatch` | Semantic / hybrid search; `explain` · `includeGraph` |
-| `ingest` | Documents → chunks → memories |
-| `compress` | LLM summary (requires `llm`) |
-| `linkMemories` / `getRelated` | Graph edges / traversal (requires `graph`) |
-| `subscribe` | Real-time change callbacks |
-| `checkpoint` / `rollback` / `listCheckpoints` / … | SQLite snapshots (+ graph file when SQLite graph) |
-| `export` / `import` | Portable SQLite + manifest |
-| `forget` / `history` / `stats` / `clear` | Lifecycle (forget/clear cascade graph when configured) |
-| `ready` / `close` / `flushTelemetry` | Lifecycle |
-
-Full reference: [wolbarg.com/docs/api](https://wolbarg.com/docs/api)
-
----
-
-## Wolbarg Studio
-
-Local observability dashboard — **not** bundled in the npm package. The SDK writes telemetry; Studio reads it (and can open memory / graph files for the canvas).
-
-```bash
-git clone https://github.com/Atharvmunde11/wolbarg-studio
-cd wolbarg-studio
-npm install
-npm run dev   # http://localhost:3100
-```
-
-Connect telemetry (`./telemetry.db`), optional memory DB, checkpoint directory, and graph backend. Screenshots and setup: [Observability & Studio](https://wolbarg.com/docs/observability).
-
----
-
-## Documentation
-
-| Topic | Link |
-| --- | --- |
-| Getting started | https://wolbarg.com/docs/getting-started |
-| Installation & project layout | https://wolbarg.com/docs/installation |
-| Configuration | https://wolbarg.com/docs/configuration |
-| Graph memory | https://wolbarg.com/docs/graph-memory |
-| Observability & Studio | https://wolbarg.com/docs/observability |
-| Concurrency | https://wolbarg.com/docs/concurrency |
-| Real-time events | https://wolbarg.com/docs/realtime-events |
-| Embedding cache | https://wolbarg.com/docs/embedding-cache |
-| Memory upsert | https://wolbarg.com/docs/memory-upsert |
-| What's new in 0.5 | https://wolbarg.com/docs/guides/whats-new |
-| Migration | https://wolbarg.com/docs/migration |
-| Limitations | https://wolbarg.com/docs/guides/limitations |
-| Changelog | [CHANGELOG.md](./CHANGELOG.md) |
-
----
-
-## Limitations
-
-- **Node 22.5+** required (`node:sqlite`).
-- **Ingest peers** required for PDF / DOCX / OCR paths.
-- **PDF** text-layer via `pdf-parse`; scan PDFs need OCR/vision.
-- **Telemetry** is SQLite-only today (Postgres typed but not implemented).
-- **SQLite `subscribe()`** is in-process only; Postgres uses LISTEN/NOTIFY.
-- **Checkpoints / export** require file-backed SQLite memory (not `:memory:` / not Postgres).
-- **Neo4j** checkpoint / export / import throw `GraphCheckpointNotSupportedError` (refuse, don't skip).
-- **Cypher `query()`** is Neo4j-only; SQLite graph uses typed methods.
-- Not an agent framework, chat UI, or hosted vector SaaS.
-
----
-
-## Upgrade
-
-```bash
-npm install wolbarg@^0.5.0
-```
-
-0.5 is **additive**. Omitting `graph` keeps 0.4 behavior. See [Migration](https://wolbarg.com/docs/migration) and [CHANGELOG](./CHANGELOG.md).
-
----
+- [Quick start](https://wolbarg.com/docs/quick-start) — remember / recall in under a minute
+- [Installation & project layout](https://wolbarg.com/docs/installation) — peers and recommended folder structure
+- [Configuration](https://wolbarg.com/docs/configuration) — every constructor option
+- [API reference](https://wolbarg.com/docs/api) — public methods and types
+- [Graph memory](https://wolbarg.com/docs/graph-memory) — SQLite ↔ Neo4j graph layer
+- [Examples](https://wolbarg.com/docs/examples) — copy-paste snippets
+- [Migration](https://wolbarg.com/docs/migration) — upgrade guides
+- [Limitations](https://wolbarg.com/docs/guides/limitations) — honest boundaries
+- [Changelog](./CHANGELOG.md) — release history
+- [llms.txt](https://wolbarg.com/llms.txt) — docs index for LLMs
 
 ## License
 

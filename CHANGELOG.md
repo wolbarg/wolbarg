@@ -5,6 +5,28 @@ All notable changes to this project are documented here.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/).
 
+## [Unreleased]
+
+### Fixed
+
+- **Postgres `compress()` atomicity:** `insertMemory` no longer joins the coalesce queue inside an ambient transaction (summary + archive now share one TX)
+- **Postgres blob archive:** `archiveMemories` deletes from `memory_embeddings_blob` when pgvector is unavailable (no longer updates missing `memory_embeddings`)
+- **Postgres TX context:** transaction `AsyncLocalStorage` is per-provider instance (no cross-instance leakage)
+- **Compress race:** abort TX when fewer than 2 sources remain active after concurrent compressors
+- **SQLite startup storm:** `open()` now retries the whole connect → WAL switch → migrate sequence on `SQLITE_BUSY` (many processes opening one file no longer fail with "database is locked"). `busy_timeout` is applied before the WAL switch
+- **SQLite savepoint corruption / lost writes under concurrency:** top-level write transactions are serialized on the single connection with an async write mutex, and the ambient-transaction bypass is now gated on an `AsyncLocalStorage` flag instead of a shared depth counter. Fixes intermittent `no such savepoint: wolbarg_sp_N` under many concurrent same-process writers, and materially improves write throughput (e.g. 32-agent same-process inserts ~2k → ~7k ops/s)
+- **CLI `askConfirm`:** used an undefined `defaultValue` (would throw at runtime); now honors the `defaultYes` parameter
+
+### Added
+
+- Postgres deadlock/serialization retries (`40P01` / `40001`) with jitter backoff
+- Postgres session timeouts: `statement_timeout`, `lock_timeout`, `idle_in_transaction_session_timeout`
+- Postgres `FOR UPDATE` on `updateMemory` and ordered row locks on archive
+- SQLite `concurrency.lockDeadlineMs` and `concurrency.multiProcess` profile
+- SQLite ambient-TX coalesce bypass (parity with Postgres)
+- Full-jitter SQLITE_BUSY backoff
+- Vector-storage-only benchmark suite: `benchmark/vector-storage-bench.ts`
+
 ## [0.5.6] — 2026-07-24
 
 ### Added

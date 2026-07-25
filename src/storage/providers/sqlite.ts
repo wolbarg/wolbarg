@@ -10,6 +10,7 @@
  * - Blob + cosine fallback on unsupported platforms (e.g. win32-arm64)
  */
 
+import { AsyncLocalStorage } from "node:async_hooks";
 import fs from "node:fs";
 import path from "node:path";
 import { DatabaseSync, type StatementSync } from "node:sqlite";
@@ -35,6 +36,7 @@ import {
 } from "../../schema/index.js";
 import { SQL } from "../../sql/index.js";
 import {
+  AsyncMutex,
   deserializeMetadata,
   embeddingToBuffer,
   serializeMetadata,
@@ -58,7 +60,10 @@ import {
   type ConcurrencyConfig,
   type ResolvedConcurrencyConfig,
 } from "../sqlite/concurrency-config.js";
-import { withImmediateTransaction } from "../sqlite/transaction.js";
+import {
+  withImmediateTransaction,
+  isSqliteBusyError,
+} from "../sqlite/transaction.js";
 import { hashMemoryContent } from "../../memory/dedupe.js";
 
 /** Hard cap when metadata cannot be fully pushed to SQL (prevents O(n) RAM blowups). */
@@ -139,6 +144,20 @@ export class SqliteStorageProvider implements StorageProvider {
   private transactionDepth = 0;
   /** Incrementing counter for deterministic savepoint names. */
   private savepointCounter = 0;
+  /**
+   * Serializes top-level write transactions on the single SQLite connection.
+   * SQLite is single-writer; serializing in-process avoids SQLITE_BUSY churn
+   * AND prevents interleaved BEGIN/SAVEPOINT state corruption when many async
+   * callers share one connection (see "no such savepoint" class of bugs).
+   */
+  private readonly writeMutex = new AsyncMutex();
+  /**
+   * Async-context flag: true while executing inside a top-level write
+   * transaction held by this provider. Used so writes issued from within an
+   * ambient transaction (e.g. compress()) join that ACID unit, WITHOUT
+   * mistaking the coalescer's own flush window for an ambient transaction.
+   */
+  private readonly txContext = new AsyncLocalStorage<boolean>();
   /** Hot in-process ANN for blob backend (sqlite-vec unavailable platforms). */
   private memoryIndex: InMemoryVectorIndex | null = null;
   private memoryIndexDirty = false;
@@ -190,75 +209,107 @@ export class SqliteStorageProvider implements StorageProvider {
 
   /** Open the database, run migrations, and prepare statements. */
   async open(): Promise<void> {
-    try {
-      const dbPath = this.resolvePath(this.connectionString);
-      this.resolvedPath = dbPath;
-      if (dbPath !== ":memory:") {
-        fs.mkdirSync(path.dirname(dbPath), { recursive: true });
-      }
+    // Opening + WAL switch + migrations take brief locks. Under a startup storm
+    // (many processes opening one file at once) these can throw SQLITE_BUSY
+    // BEFORE any per-write retry loop applies, so retry the whole open here.
+    const startedAt = performance.now();
+    let attempt = 0;
+    for (;;) {
+      try {
+        this.openOnce();
+        return;
+      } catch (error) {
+        try {
+          this.db?.close();
+        } catch {
+          // ignore close errors during failed open
+        }
+        this.db = null;
+        this.statements = null;
 
-      const db = new DatabaseSync(dbPath, { allowExtension: true });
-      this.db = db;
-
-      // WAL + NORMAL is the production-safe default (multi-reader friendly).
-      // Single-process SDK keeps locking_mode=NORMAL (not EXCLUSIVE) so other
-      // tools/processes can open the same file for backups or inspection.
-      db.exec("PRAGMA journal_mode = WAL;");
-      db.exec(`
-        PRAGMA synchronous = NORMAL;
-        PRAGMA foreign_keys = ON;
-        PRAGMA busy_timeout = ${this.concurrency.lockTimeoutMs};
-        PRAGMA temp_store = MEMORY;
-        PRAGMA cache_size = -32768;
-        PRAGMA mmap_size = 134217728;
-        PRAGMA wal_autocheckpoint = 2000;
-        PRAGMA recursive_triggers = OFF;
-      `);
-
-      this.sqliteVecLoaded = this.tryLoadSqliteVec(db);
-      this.runMigrations(db);
-      this.statements = this.prepareStatements(db);
-      // FTS consistency check only on fresh / upgraded DBs (see runMigrations).
-      // Re-scanning every warm open costs measurable ms for no benefit.
-
-      const backend = this.readMetaString(META_KEYS.vectorBackend) as VectorBackend | null;
-      const dims = this.readMetaNumber(META_KEYS.embeddingDimensions);
-
-      if (backend) {
-        this.vectorBackend = backend;
-      } else if (this.sqliteVecLoaded) {
-        this.vectorBackend = "sqlite-vec";
-      } else {
-        if (!warnedSqliteVecFallback) {
-          warnedSqliteVecFallback = true;
-          warnLogger.warn(
-            "sqlite-vec unavailable on this platform; using blob ANN fallback.",
+        const busy = isSqliteBusyError(error);
+        const exhausted =
+          attempt >= this.concurrency.maxRetries ||
+          performance.now() - startedAt >= this.concurrency.lockDeadlineMs;
+        if (!busy || exhausted) {
+          throw new InitializationError(
+            `Failed to open SQLite database: ${this.describe(error)}`,
+            { cause: error instanceof Error ? error : undefined },
           );
         }
-        this.vectorBackend = "blob";
+        const base = Math.min(
+          this.concurrency.maxBackoffMs,
+          this.concurrency.baseBackoffMs * 2 ** attempt,
+        );
+        const delay = Math.random() * base;
+        this.retryLog?.(
+          `SQLITE_BUSY during open attempt=${attempt + 1} backoffMs=${Math.round(delay)}`,
+        );
+        attempt += 1;
+        await new Promise((r) => setTimeout(r, delay));
       }
+    }
+  }
 
-      if (dims !== null) {
-        this.vectorDimensions = dims;
-        this.ensureVectorStorage(dims);
-        this.reprepareVectorStatements();
-        // Blob ANN hydrate is deferred until first search (warm-start win).
-        if (this.vectorBackend === "blob") {
-          this.memoryIndexDirty = true;
-        }
+  /** Single open attempt — connect, apply pragmas, migrate, prepare. */
+  private openOnce(): void {
+    const dbPath = this.resolvePath(this.connectionString);
+    this.resolvedPath = dbPath;
+    if (dbPath !== ":memory:") {
+      fs.mkdirSync(path.dirname(dbPath), { recursive: true });
+    }
+
+    const db = new DatabaseSync(dbPath, { allowExtension: true });
+    this.db = db;
+
+    // busy_timeout must be set FIRST so the WAL switch + migrations below wait
+    // for a contended lock instead of failing fast during a startup storm.
+    db.exec(`PRAGMA busy_timeout = ${this.concurrency.lockTimeoutMs};`);
+    // WAL + NORMAL is the production-safe default (multi-reader friendly).
+    // Single-process SDK keeps locking_mode=NORMAL (not EXCLUSIVE) so other
+    // tools/processes can open the same file for backups or inspection.
+    db.exec("PRAGMA journal_mode = WAL;");
+    db.exec(`
+      PRAGMA synchronous = NORMAL;
+      PRAGMA foreign_keys = ON;
+      PRAGMA temp_store = MEMORY;
+      PRAGMA cache_size = -32768;
+      PRAGMA mmap_size = 134217728;
+      PRAGMA wal_autocheckpoint = 2000;
+      PRAGMA recursive_triggers = OFF;
+    `);
+
+    this.sqliteVecLoaded = this.tryLoadSqliteVec(db);
+    this.runMigrations(db);
+    this.statements = this.prepareStatements(db);
+    // FTS consistency check only on fresh / upgraded DBs (see runMigrations).
+    // Re-scanning every warm open costs measurable ms for no benefit.
+
+    const backend = this.readMetaString(META_KEYS.vectorBackend) as VectorBackend | null;
+    const dims = this.readMetaNumber(META_KEYS.embeddingDimensions);
+
+    if (backend) {
+      this.vectorBackend = backend;
+    } else if (this.sqliteVecLoaded) {
+      this.vectorBackend = "sqlite-vec";
+    } else {
+      if (!warnedSqliteVecFallback) {
+        warnedSqliteVecFallback = true;
+        warnLogger.warn(
+          "sqlite-vec unavailable on this platform; using blob ANN fallback.",
+        );
       }
-    } catch (error) {
-      try {
-        this.db?.close();
-      } catch {
-        // ignore close errors during failed open
+      this.vectorBackend = "blob";
+    }
+
+    if (dims !== null) {
+      this.vectorDimensions = dims;
+      this.ensureVectorStorage(dims);
+      this.reprepareVectorStatements();
+      // Blob ANN hydrate is deferred until first search (warm-start win).
+      if (this.vectorBackend === "blob") {
+        this.memoryIndexDirty = true;
       }
-      this.db = null;
-      this.statements = null;
-      throw new InitializationError(
-        `Failed to open SQLite database: ${this.describe(error)}`,
-        { cause: error instanceof Error ? error : undefined },
-      );
     }
   }
 
@@ -344,6 +395,14 @@ export class SqliteStorageProvider implements StorageProvider {
   /** Insert a single memory row (coalesced under concurrent writers). */
   async insertMemory(input: InsertMemoryInput): Promise<MemoryRow> {
     this.requireVectorReady();
+    // Inside an ambient transaction (e.g. compress), write immediately so the
+    // insert participates in the outer ACID unit instead of the coalesce queue.
+    // Gate on the async-context flag (NOT transactionDepth): the coalescer's
+    // own flush transiently sets transactionDepth while awaiting, and a
+    // concurrent remember() must NOT be pulled onto the savepoint path there.
+    if (this.txContext.getStore() === true) {
+      return this.insertMemoryImmediate(input);
+    }
     // Coalesce concurrent writers into one BEGIN IMMEDIATE + multi-row insert.
     // Without this, each remember() pays a full fsync-bound commit.
     return new Promise<MemoryRow>((resolve, reject) => {
@@ -728,7 +787,8 @@ export class SqliteStorageProvider implements StorageProvider {
     const archived: string[] = [];
 
     return this.withTransaction(() => {
-      for (const id of ids) {
+      const orderedIds = [...new Set(ids)].sort();
+      for (const id of orderedIds) {
         const existing = stmts.getMemoryById.get(id, organization) as unknown as
           | MemoryRow
           | undefined;
@@ -905,10 +965,12 @@ export class SqliteStorageProvider implements StorageProvider {
 
   async withTransaction<T>(fn: () => T | Promise<T>): Promise<T> {
     const db = this.requireDb();
-    // Nested writes can happen (e.g. compress() wrapping storage.withTransaction()
-    // while provider methods also use withTransaction internally).
+    // Genuine synchronous nesting inside an already-held transaction on this
+    // connection (e.g. compress() -> insertMemory()/archiveMemories()).
     // SQLite forbids BEGIN/COMMIT inside a transaction, so we use SAVEPOINTs.
-    if (this.transactionDepth > 0) {
+    // We DON'T re-acquire the write mutex here: the outer top-level tx already
+    // holds it, so re-acquiring would self-deadlock.
+    if (this.txContext.getStore() === true) {
       const savepointName = `wolbarg_sp_${this.savepointCounter++}`;
       db.exec(`SAVEPOINT ${savepointName}`);
       try {
@@ -928,21 +990,28 @@ export class SqliteStorageProvider implements StorageProvider {
       }
     }
 
-    this.transactionDepth = 1;
-    try {
-      return await withImmediateTransaction(
-        db,
-        this.concurrency,
-        fn,
-        (attempt, delayMs) => {
-          this.retryLog?.(
-            `SQLITE_BUSY retry attempt=${attempt} backoffMs=${Math.round(delayMs)}`,
+    // Top-level transaction: serialize on the connection so no two BEGIN
+    // IMMEDIATE / SAVEPOINT sequences ever interleave on the shared handle.
+    return this.writeMutex.runExclusive(() =>
+      this.txContext.run(true, async () => {
+        this.transactionDepth = 1;
+        this.savepointCounter = 0;
+        try {
+          return await withImmediateTransaction(
+            db,
+            this.concurrency,
+            fn,
+            (attempt, delayMs) => {
+              this.retryLog?.(
+                `SQLITE_BUSY retry attempt=${attempt} backoffMs=${Math.round(delayMs)}`,
+              );
+            },
           );
-        },
-      );
-    } finally {
-      this.transactionDepth = 0;
-    }
+        } finally {
+          this.transactionDepth = 0;
+        }
+      }),
+    );
   }
 
   // ─── internals ───────────────────────────────────────────────────────────

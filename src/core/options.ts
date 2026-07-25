@@ -83,7 +83,7 @@ export interface WolbargOptionsBase {
   organization: string;
   /**
    * Storage provider instance or config.
-   * Prefer `database` in docs; `storage` remains fully supported.
+   * Prefer `storage: sqlite(...)` / `postgres(...)` in docs; `database` remains supported.
    */
   storage?: StorageInput;
   /**

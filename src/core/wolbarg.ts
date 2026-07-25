@@ -1716,12 +1716,19 @@ export class Wolbarg<HasLlm extends boolean = false> {
             updatedAt: timestamp,
           });
 
+          const sourceIds = [...records.map((r) => r.id)].sort();
           const archivedIds = await storage.archiveMemories(
-            records.map((r) => r.id),
+            sourceIds,
             organization,
             summaryId,
             timestamp,
           );
+
+          if (archivedIds.length < 2) {
+            throw new ValidationError(
+              "compress lost a concurrency race: fewer than 2 source memories remained active",
+            );
+          }
 
           return {
             summary: toMemoryRecord(summaryRow),

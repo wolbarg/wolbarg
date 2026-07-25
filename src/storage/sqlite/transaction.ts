@@ -20,6 +20,7 @@ function sleep(ms: number): Promise<void> {
   return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
+/** Full-jitter exponential backoff, capped at maxBackoffMs. */
 function backoffDelay(
   attempt: number,
   config: ResolvedConcurrencyConfig,
@@ -28,8 +29,15 @@ function backoffDelay(
     config.maxBackoffMs,
     config.baseBackoffMs * 2 ** attempt,
   );
-  const jitter = Math.random() * config.baseBackoffMs;
-  return Math.min(config.maxBackoffMs, exp + jitter);
+  // Full jitter: uniform in [0, exp] reduces synchronized retry storms.
+  return Math.random() * exp;
+}
+
+function deadlineExceeded(
+  startedAt: number,
+  config: ResolvedConcurrencyConfig,
+): boolean {
+  return performance.now() - startedAt >= config.lockDeadlineMs;
 }
 
 /**
@@ -42,7 +50,11 @@ export function withImmediateTransactionSync<T>(
   onRetry?: (attempt: number, delayMs: number, error: unknown) => void,
 ): T {
   let lastError: unknown;
+  const startedAt = performance.now();
   for (let attempt = 0; attempt <= config.maxRetries; attempt += 1) {
+    if (attempt > 0 && deadlineExceeded(startedAt, config)) {
+      break;
+    }
     try {
       db.exec("BEGIN IMMEDIATE");
       try {
@@ -63,7 +75,7 @@ export function withImmediateTransactionSync<T>(
       if (!isBusy) {
         throw error;
       }
-      if (attempt >= config.maxRetries) {
+      if (attempt >= config.maxRetries || deadlineExceeded(startedAt, config)) {
         break;
       }
       const delay = backoffDelay(attempt, config);
@@ -81,7 +93,7 @@ export function withImmediateTransactionSync<T>(
       cause: lastError instanceof Error ? lastError : undefined,
       reason: "SQLITE_BUSY exhausted retries",
       suggestion:
-        "Increase concurrency.maxRetries or concurrency.lockTimeoutMs, or consider the Postgres backend for high-concurrency multi-agent workloads.",
+        "Increase concurrency.maxRetries / concurrency.lockDeadlineMs, set concurrency.multiProcess: true for shared-file writers, or use the Postgres backend.",
     },
   );
 }
@@ -96,7 +108,11 @@ export async function withImmediateTransaction<T>(
   onRetry?: (attempt: number, delayMs: number, error: unknown) => void,
 ): Promise<T> {
   let lastError: unknown;
+  const startedAt = performance.now();
   for (let attempt = 0; attempt <= config.maxRetries; attempt += 1) {
+    if (attempt > 0 && deadlineExceeded(startedAt, config)) {
+      break;
+    }
     try {
       db.exec("BEGIN IMMEDIATE");
       try {
@@ -117,7 +133,7 @@ export async function withImmediateTransaction<T>(
       if (!isBusy) {
         throw error;
       }
-      if (attempt >= config.maxRetries) {
+      if (attempt >= config.maxRetries || deadlineExceeded(startedAt, config)) {
         break;
       }
       const delay = backoffDelay(attempt, config);
@@ -131,7 +147,7 @@ export async function withImmediateTransaction<T>(
       cause: lastError instanceof Error ? lastError : undefined,
       reason: "SQLITE_BUSY exhausted retries",
       suggestion:
-        "Increase concurrency.maxRetries or concurrency.lockTimeoutMs, or consider the Postgres backend for high-concurrency multi-agent workloads.",
+        "Increase concurrency.maxRetries / concurrency.lockDeadlineMs, set concurrency.multiProcess: true for shared-file writers, or use the Postgres backend.",
     },
   );
 }

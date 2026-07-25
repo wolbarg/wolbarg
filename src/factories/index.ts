@@ -32,8 +32,14 @@ import { Wolbarg } from "../core/wolbarg.js";
  * wolbarg({ organization: "acme", storage: sqlite("./memory.db"), embedding: ... })
  * ```
  */
-export function sqlite(connectionString: string): StorageProvider {
-  return new SqliteStorageProvider({ connectionString });
+export function sqlite(
+  connectionString: string,
+  options?: { concurrency?: import("../types/index.js").ConcurrencyConfig },
+): StorageProvider {
+  return new SqliteStorageProvider({
+    connectionString,
+    concurrency: options?.concurrency,
+  });
 }
 
 /**

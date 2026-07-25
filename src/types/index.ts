@@ -149,6 +149,10 @@ export interface ConcurrencyConfig {
   baseBackoffMs?: number;
   maxBackoffMs?: number;
   lockTimeoutMs?: number;
+  /** Total lock-wait + retry budget in ms. */
+  lockDeadlineMs?: number;
+  /** Use multi-process-oriented defaults when many OS processes share one DB file. */
+  multiProcess?: boolean;
 }
 
 /** Transparent embedding cache configuration. */

@@ -1,0 +1,27 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 64 64" fill="none" role="img" aria-label="Wolbarg">
+  <defs>
+    <linearGradient id="wb-ice" x1="32" y1="2" x2="32" y2="62" gradientUnits="userSpaceOnUse">
+      <stop stop-color="#4EC4E8"/>
+      <stop offset="0.5" stop-color="#8FDCF0"/>
+      <stop offset="1" stop-color="#D4F3FA"/>
+    </linearGradient>
+  </defs>
+  <!-- Left ear -->
+  <polygon fill="url(#wb-ice)" points="8,3 20,21 2,19"/>
+  <!-- Right ear -->
+  <polygon fill="url(#wb-ice)" points="56,3 44,21 62,19"/>
+  <!-- Forehead / crown -->
+  <polygon fill="url(#wb-ice)" points="20,10 44,10 46,20 42,24 32,22 22,24 18,20"/>
+  <!-- Left eye plate (diagonal negative space forms eye) -->
+  <polygon fill="url(#wb-ice)" points="2,19 18,21 21,27 16,31 8,34 2,28"/>
+  <!-- Right eye plate -->
+  <polygon fill="url(#wb-ice)" points="62,19 46,21 43,27 48,31 56,34 62,28"/>
+  <!-- Center bridge / muzzle -->
+  <polygon fill="url(#wb-ice)" points="22,24 32,22 42,24 40,32 32,36 24,32"/>
+  <!-- Left cheek / jaw -->
+  <polygon fill="url(#wb-ice)" points="8,34 16,31 24,32 28,48 14,50 4,40"/>
+  <!-- Right cheek / jaw -->
+  <polygon fill="url(#wb-ice)" points="56,34 48,31 40,32 36,48 50,50 60,40"/>
+  <!-- Snout tip -->
+  <polygon fill="url(#wb-ice)" points="28,48 32,36 36,48 32,58"/>
+</svg>

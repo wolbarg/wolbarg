@@ -74,9 +74,26 @@ export interface PostgresProviderOptions {
   durableWrites?: boolean;
 }
 
-const txStore = new AsyncLocalStorage<PgPoolClient>();
-
 const warnLogger = new WolbargLogger("warn");
+
+/** True for Postgres deadlock / serialization failures that are safe to retry. */
+function isRetriablePgTxError(error: unknown): boolean {
+  const code =
+    error && typeof error === "object" && "code" in error
+      ? String((error as { code?: unknown }).code ?? "")
+      : "";
+  if (code === "40P01" || code === "40001") {
+    return true;
+  }
+  const msg = error instanceof Error ? error.message : String(error);
+  return /deadlock detected|could not serialize access/i.test(msg);
+}
+
+function pgTxBackoffMs(attempt: number): number {
+  const base = 25 * 2 ** attempt;
+  const jitter = Math.random() * 25;
+  return Math.min(1000, base + jitter);
+}
 let warnedPgvectorFallback = false;
 let warnedFtsKeywordSearch = false;
 let warnedHnswSoftFail = false;
@@ -147,6 +164,10 @@ function withPoolStartupOptions(
     // Bake HNSW search GUCs into the connection — avoids per-recall set_config.
     "-c hnsw.ef_search=40",
     "-c hnsw.iterative_scan=relaxed_order",
+    // Bound waits so lock storms cannot hang agents indefinitely.
+    "-c statement_timeout=30000",
+    "-c lock_timeout=10000",
+    "-c idle_in_transaction_session_timeout=60000",
   ];
   if (!durableWrites) {
     flags.unshift("-c synchronous_commit=off");
@@ -239,6 +260,8 @@ export class PostgresStorageProvider implements StorageProvider {
   private insertFlushScheduled = false;
   private insertFlushTimer: ReturnType<typeof setTimeout> | null = null;
   private insertFlushInFlight = 0;
+  /** Per-provider TX context — never share across PostgresStorageProvider instances. */
+  private readonly txStore = new AsyncLocalStorage<PgPoolClient>();
 
   /**
    * @param options - Connection string, pool size, and durability flags.
@@ -581,7 +604,13 @@ export class PostgresStorageProvider implements StorageProvider {
   async insertMemory(input: InsertMemoryInput): Promise<MemoryRow> {
     this.requireVectorReady();
 
-    // Always coalesce briefly so concurrent remember() calls share one unnest.
+    // Inside an ambient transaction (e.g. compress), never join the coalesce
+    // queue — that would commit on a different connection and break atomicity.
+    if (this.txStore.getStore()) {
+      return this.insertMemoryImmediate(input);
+    }
+
+    // Coalesce briefly so concurrent remember() calls share one unnest.
     // Do NOT hold a global inFlight mutex — that serializes Postgres like SQLite.
     return new Promise<MemoryRow>((resolve, reject) => {
       this.insertQueue.push({ input, resolve, reject });
@@ -858,10 +887,18 @@ export class PostgresStorageProvider implements StorageProvider {
   /** Update memory content, metadata, embedding, and content hash. */
   async updateMemory(input: UpdateMemoryInput): Promise<MemoryRow | null> {
     return this.withTransaction(async () => {
-      const existing = await this.getMemoryById(input.id, input.organization);
-      if (!existing) {
+      const locked = await this.query(
+        `SELECT id, organization, agent, content_text, metadata_json,
+                archived::int AS archived, compressed_into, content_hash, created_at, updated_at
+         FROM memories
+         WHERE id = $1 AND organization = $2
+         FOR UPDATE`,
+        [input.id, input.organization],
+      );
+      if (locked.rows.length === 0) {
         return null;
       }
+      const existing = this.mapRow(locked.rows[0]!);
       const contentHash =
         input.contentHash !== undefined
           ? input.contentHash
@@ -1245,23 +1282,40 @@ export class PostgresStorageProvider implements StorageProvider {
       if (ids.length === 0) {
         return [];
       }
+      // Deterministic lock order prevents multi-row deadlocks across compressors.
+      const orderedIds = [...new Set(ids)].sort();
+      await this.query(
+        `SELECT id FROM memories
+         WHERE organization = $1 AND archived = false AND id = ANY($2::text[])
+         ORDER BY id
+         FOR UPDATE`,
+        [organization, orderedIds],
+      );
       const result = await this.query(
         `UPDATE memories
          SET archived = true, compressed_into = $1, updated_at = $2
          WHERE organization = $3 AND archived = false AND id = ANY($4::text[])
          RETURNING id`,
-        [compressedIntoId, archivedAt, organization, ids],
+        [compressedIntoId, archivedAt, organization, orderedIds],
       );
       const archived = result.rows.map((r) => String(r.id));
       if (archived.length === 0) {
         return [];
       }
-      await this.query(
-        `UPDATE memory_embeddings
-         SET archived = true
-         WHERE memory_id = ANY($1::text[])`,
-        [archived],
-      );
+      if (this.hasPgvector) {
+        await this.query(
+          `UPDATE memory_embeddings
+           SET archived = true
+           WHERE memory_id = ANY($1::text[])`,
+          [archived],
+        );
+      } else {
+        // Blob ANN has no archived flag — drop embeddings so exact scan skips them.
+        await this.query(
+          `DELETE FROM memory_embeddings_blob WHERE memory_id = ANY($1::text[])`,
+          [archived],
+        );
+      }
       const histIds: string[] = [];
       const memIds: string[] = [];
       const types: string[] = [];
@@ -1380,27 +1434,41 @@ export class PostgresStorageProvider implements StorageProvider {
   }
 
   async withTransaction<T>(fn: () => T | Promise<T>): Promise<T> {
-    const existing = txStore.getStore();
+    const existing = this.txStore.getStore();
     if (existing) {
       return fn();
     }
-    const client = await this.requirePool().connect();
-    try {
-      await client.query("BEGIN");
-      const result = await txStore.run(client, fn);
-      await client.query("COMMIT");
-      return result;
-    } catch (error) {
-      await client.query("ROLLBACK").catch(() => undefined);
-      if (error instanceof DatabaseError || error instanceof InitializationError) {
-        throw error;
+
+    const maxAttempts = 5;
+    let lastError: unknown;
+    for (let attempt = 0; attempt < maxAttempts; attempt += 1) {
+      const client = await this.requirePool().connect();
+      try {
+        await client.query("BEGIN");
+        const result = await this.txStore.run(client, fn);
+        await client.query("COMMIT");
+        return result;
+      } catch (error) {
+        await client.query("ROLLBACK").catch(() => undefined);
+        lastError = error;
+        if (isRetriablePgTxError(error) && attempt < maxAttempts - 1) {
+          await new Promise((r) => setTimeout(r, pgTxBackoffMs(attempt)));
+          continue;
+        }
+        if (error instanceof DatabaseError || error instanceof InitializationError) {
+          throw error;
+        }
+        throw new DatabaseError(`Transaction failed: ${this.describe(error)}`, {
+          cause: error instanceof Error ? error : undefined,
+        });
+      } finally {
+        client.release();
       }
-      throw new DatabaseError(`Transaction failed: ${this.describe(error)}`, {
-        cause: error instanceof Error ? error : undefined,
-      });
-    } finally {
-      client.release();
     }
+    throw new DatabaseError(
+      `Transaction failed after retries: ${this.describe(lastError)}`,
+      { cause: lastError instanceof Error ? lastError : undefined },
+    );
   }
 
   private async runMigrations(): Promise<void> {
@@ -1663,7 +1731,7 @@ export class PostgresStorageProvider implements StorageProvider {
     text: string,
     params?: unknown[],
   ): Promise<PgQueryResult> {
-    const tx = txStore.getStore();
+    const tx = this.txStore.getStore();
     const target: PgQueryable = tx ?? this.requirePool();
     return target.query(text, params);
   }
@@ -1674,7 +1742,7 @@ export class PostgresStorageProvider implements StorageProvider {
     text: string,
     params: unknown[],
   ): Promise<PgQueryResult> {
-    const tx = txStore.getStore();
+    const tx = this.txStore.getStore();
     const target: PgQueryable = tx ?? this.requirePool();
     return target.query({ name, text, values: params });
   }

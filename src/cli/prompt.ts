@@ -97,10 +97,10 @@ export async function askConfirm(
   label: string,
   defaultYes = true,
 ): Promise<boolean> {
-  const hint = defaultValue ? "Y/n" : "y/N";
+  const hint = defaultYes ? "Y/n" : "y/N";
   const answer = (await rl.question(`${label} (${hint}): `)).trim().toLowerCase();
-  if (answer === "") return defaultValue;
+  if (answer === "") return defaultYes;
   if (answer === "y" || answer === "yes") return true;
   if (answer === "n" || answer === "no") return false;
-  return defaultValue;
+  return defaultYes;
 }
