@@ -10,4 +10,8 @@ coverage/
 .vitest/
 tmp/
 temp/
+.tmp-*/
+.tmp-*
 .env
+.env.*.local
+.wolbarg/.env

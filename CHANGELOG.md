@@ -5,27 +5,62 @@ All notable changes to this project are documented here.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/).
 
-## [Unreleased]
+## [0.6.0] — 2026-07-26
 
-### Fixed
+Production-hardening release for the public SDK. Focus: correctness under concurrent writers, fail-closed retrieval, multi-tenant isolation, Postgres SSL/schema defaults, and honest documentation.
 
-- **Postgres `compress()` atomicity:** `insertMemory` no longer joins the coalesce queue inside an ambient transaction (summary + archive now share one TX)
-- **Postgres blob archive:** `archiveMemories` deletes from `memory_embeddings_blob` when pgvector is unavailable (no longer updates missing `memory_embeddings`)
-- **Postgres TX context:** transaction `AsyncLocalStorage` is per-provider instance (no cross-instance leakage)
-- **Compress race:** abort TX when fewer than 2 sources remain active after concurrent compressors
-- **SQLite startup storm:** `open()` now retries the whole connect → WAL switch → migrate sequence on `SQLITE_BUSY` (many processes opening one file no longer fail with "database is locked"). `busy_timeout` is applied before the WAL switch
-- **SQLite savepoint corruption / lost writes under concurrency:** top-level write transactions are serialized on the single connection with an async write mutex, and the ambient-transaction bypass is now gated on an `AsyncLocalStorage` flag instead of a shared depth counter. Fixes intermittent `no such savepoint: wolbarg_sp_N` under many concurrent same-process writers, and materially improves write throughput (e.g. 32-agent same-process inserts ~2k → ~7k ops/s)
-- **CLI `askConfirm`:** used an undefined `defaultValue` (would throw at runtime); now honors the `defaultYes` parameter
+### Removed
+
+- **Graph memory** — `sqliteGraph` / `neo4jGraph`, `linkMemories` / `getRelated`, `includeGraph`, Neo4j peer dependency, related tests, and the leftover `src/graph` tree. Graph is no longer part of the SDK surface.
+
+### Breaking
+
+- **Rerank fail-closed** — built-in HTTP / OpenAI chat rerankers throw `RerankError` (`RERANK_ERROR`) on HTTP errors, network/timeouts, or empty/unparseable rankings. Silent identity-order fallback is removed so `rerank: true` never looks successful while ranking was skipped. Custom `RerankerProvider` implementations may still soft-fail if they choose to.
+- **Fail-closed recall** — `hybrid: true` without a keyword channel and `rerank: true` without a reranker throw `ValidationError` instead of silently degrading.
+- **Hybrid keyword channel** — SQLite/Postgres `searchKeyword` no longer swallows FTS failures into empty hits. Unavailable or broken FTS now throws.
+- **Telemetry privacy** — `captureQueries` now defaults to `false` (opt-in to persist query strings).
+- **Subscribe tenant lock** — `subscribe()` cannot override `organization` to another tenant.
+- **Postgres TLS defaults** — non-loopback connection strings without `sslmode`/`ssl` get `sslmode=require`. Loopback hosts are unchanged. Override with `ssl: false` / `"disable"` (warns for remote hosts), `ssl: true` / `"require"`, or `"prefer"`.
+- **Postgres pool default** — `maxPoolSize` default lowered from `64` to `20` (safer for shared managed Postgres). Raise explicitly for high-concurrency hosts.
+- **Multi-tenant file transfer** — `export` / `import` / `checkpoint` / `rollback` refuse to operate on a SQLite file that contains memories from any other organization.
 
 ### Added
 
-- Postgres deadlock/serialization retries (`40P01` / `40001`) with jitter backoff
-- Postgres session timeouts: `statement_timeout`, `lock_timeout`, `idle_in_transaction_session_timeout`
-- Postgres `FOR UPDATE` on `updateMemory` and ordered row locks on archive
-- SQLite `concurrency.lockDeadlineMs` and `concurrency.multiProcess` profile
-- SQLite ambient-TX coalesce bypass (parity with Postgres)
-- Full-jitter SQLITE_BUSY backoff
-- Vector-storage-only benchmark suite: `benchmark/vector-storage-bench.ts`
+- **`AbortSignal` cancellation** — `signal?: AbortSignal` on `remember`, `rememberFromMessages`, `recall`, `update`, `compress`, and `forget`. Throws `CancellationError` (`OPERATION_CANCELLED`). Built-in OpenAI-compatible embedder combines the caller signal with its timeout via `AbortSignal.any`.
+- **Postgres `schema` option** — `postgres({ connectionString, schema: "wolbarg" })` puts every table, index, and NOTIFY channel in a named schema. Independent deployments (including different embedding dimensions) can share one database.
+- **Schema-scoped NOTIFY** — custom schema uses `wolbarg_events_<schema>`; default schema keeps `wolbarg_events`.
+- **`RerankError`** public export.
+- **`MAX_MEMORY_CONTENT_CHARS` (1_000_000)** / **`MAX_METADATA_JSON_BYTES` (256_000)** — exported DoS guards on `content.text` and serialized metadata.
+- **Release CI matrix** — Ubuntu (typecheck / build / live Postgres) + Windows (typecheck / build / SQLite). Both verify `dist` keeps `node:sqlite`.
+- **Dependabot** — weekly grouped npm (minor/patch) and GitHub Actions updates.
+- **`npm run test:dist`** — verifies dist keeps `node:sqlite`; wired into `prepublishOnly`.
+- Hermetic live-Postgres harness (`tests/pg-live.ts`) with `.env.test.example` / `.env.test.local`.
+- [Architecture notes](./docs/architecture.md) covering coalescing, WAL, CAS, Postgres locking, SSL, and trust boundaries.
+- Concurrency stress tests, multi-tenant isolation tests, schema isolation tests, SSL policy tests, rerank fail-closed tests.
+
+### Fixed
+
+- **Rollback / import reopen** — if storage was closed for a file swap and reopen fails, the SDK throws `InitializationError` instead of leaving the facade silently unusable.
+- **Postgres TX retries** — top-level transactions retry on deadlock (`40P01`) and serialization failure (`40001`) with full-jitter backoff.
+- **Postgres session timeouts** — pool connections set `statement_timeout`, `lock_timeout`, and `idle_in_transaction_session_timeout`.
+- **Postgres TX context** — `AsyncLocalStorage` is per provider instance (no cross-instance leakage).
+- **Postgres blob archive** — archived memories also clear `memory_embeddings_blob` rows when present.
+- **Postgres vector DDL** — embedding dimensions validated before interpolating `vector(N)`.
+- **Postgres catalog probes** — HNSW and `content_tsv` detection filter on `current_schema()`.
+- **Postgres pgvector detection** — `CREATE EXTENSION` success no longer assumes the `vector` type is usable; resolved with `to_regtype('vector')`.
+- **Postgres LISTEN identifier** — channel is quoted so mixed-case channels match `pg_notify()`.
+- **SQLite savepoint corruption** — top-level write transactions serialized with an async write mutex; ambient nesting uses `AsyncLocalStorage`.
+- **SQLite cold open** — `open()` retries connect → busy_timeout → WAL → migrate on `SQLITE_BUSY`.
+- **Compress race** — abort when fewer than 2 sources remain active after concurrent compressors.
+- **`wolbarg()` / `createWolbarg()` typing** — overloads preserve `Wolbarg<true>` when `llm` is provided.
+- Multi-org SQLite open warning (export/checkpoint still refuse; operators are warned at `open()`).
+- Documentation honesty — claims aligned with implemented behavior (no unverified benchmark numbers in this tree; Postgres telemetry marked unimplemented).
+
+### Changed
+
+- SQLite `concurrency.lockDeadlineMs` and `concurrency.multiProcess` profile documented for operators.
+- Full-jitter `SQLITE_BUSY` backoff on write transactions.
+- Companion `@wolbarg/*` adapters should peer-depend on `wolbarg >= 0.6.0` (bump when republishing those packages).
 
 ## [0.5.6] — 2026-07-24
 
@@ -45,13 +80,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ### Added
 
-- **Comprehensive JSDoc** across the SDK and official adapter packages — every exported function, method, class, interface, and notable helper now has descriptions with `@param` / `@returns` / `@example` where useful for IDE hover documentation
-- Provider interface docs explain how to implement custom storage, telemetry, checkpoint, graph, OCR, vision, rerank, and keyword backends
+- **Comprehensive JSDoc** across the core SDK — every exported function, method, class, interface, and notable helper now has descriptions with `@param` / `@returns` / `@example` where useful for IDE hover documentation (framework adapters ship in separate packages, not this tree)
+- Provider interface docs explain how to implement custom storage, telemetry, checkpoint, OCR, vision, rerank, and keyword backends
 
 ### Changed
 
 - **`SDK_VERSION`** and package version bumped to **0.5.5**
-- Adapter packages peer-depend on `wolbarg >= 0.5.5`
+- Adapter packages (published separately) peer-depend on `wolbarg >= 0.5.5`
 
 ### Compatibility
 
@@ -61,8 +96,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ### Added
 
-- **Official framework adapters (`@1.0.0`)** — `@wolbarg/openai`, `@wolbarg/langchain`, `@wolbarg/llamaindex`, `@wolbarg/mastra` (alongside existing `@wolbarg/vercel-ai`)
-- Docs + runnable examples under `examples/adapters/*` and [Integrations](https://wolbarg.com/docs/integrations)
+- **Official framework adapters (`@1.0.0`, separate packages)** — `@wolbarg/openai`, `@wolbarg/langchain`, `@wolbarg/llamaindex`, `@wolbarg/mastra` (alongside existing `@wolbarg/vercel-ai`); not vendored in this repository tree
+- Docs + integration guides on [Integrations](https://wolbarg.com/docs/integrations)
 
 ### Compatibility
 
@@ -73,17 +108,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 ### Added
 
 - **`rememberFromMessages()` (experimental)** — conversation → memory bridge with `mode: "raw"` (default, no LLM) and optional `mode: "extract"` via configured `llm`
-- **Vercel AI SDK adapter example** — `examples/adapters/vercel-ai/` (now uses official `@wolbarg/vercel-ai` middleware)
-- **Companion package `@wolbarg/vercel-ai`** — Language Model Middleware (`wolbargMiddleware` + `wrapLanguageModel`) for automatic recall / remember (published separately under `packages/vercel-ai/`)
+- **Companion package `@wolbarg/vercel-ai`** — Language Model Middleware (`wolbargMiddleware` + `wrapLanguageModel`) for automatic recall / remember (published separately; not in this tree)
 
 ### Compatibility
 
-- Additive only. Omit the new method and behavior matches **0.5.1**. Experimental API may change before 1.0 — pin versions if you depend on it.
+- Additive only. Omit the new method and behavior matches **0.5.1**. Experimental API may change — pin versions if you depend on it.
 - Core `wolbarg` remains framework-agnostic; AI SDK types live only in `@wolbarg/vercel-ai`.
 - `@wolbarg/vercel-ai@1` requires **AI SDK v7+** (`ai@^7`). Upgrade from AI SDK v4 before adopting the middleware.
 
 ## [0.5.1] — 2026-07-19
-
 
 ### Fixed
 
@@ -97,20 +130,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ### Added
 
-- **Optional graph memory** — `graph` constructor option with `sqliteGraph({ path })` (local) and `neo4jGraph({ url, username, password })` (networked); optional peer `neo4j-driver`
-- **Typed graph API** — `linkMemories()`, `getRelated()` on the facade; provider surface also includes `unlinkMemories`, `upsertEntity`, `linkEntityToMemory`, `deleteMemory`
-- **`recall({ includeGraph: true })`** — attaches `related` neighbor memories from the graph
-- **Cascade deletes** — `forget` / `clear` remove graph memory nodes and incident edges when graph is configured
-- **Graph-aware checkpoints / export** — file-backed SQLite graph snapshots alongside memory DB; Neo4j refuses with `GraphCheckpointNotSupportedError` (`GRAPH_CHECKPOINT_NOT_SUPPORTED`)
-- **Schema v4** — memory DB index / ANN housekeeping migration on open (graph tables live in a separate SQLite file or Neo4j)
-- **Wolbarg Studio** — graph canvas, Connect for memory/telemetry/checkpoints/graph, ops filters for graph methods, stream / checkpoints / explain polish
-- **Docs** — Graph memory, What's New 0.5, Observability screenshots, provider-isolated project layout
+- **Optional graph memory** (removed in 0.6.0) — historical note only
+- **Schema v4** — memory DB index / ANN housekeeping migration on open
+- **Wolbarg Studio** — separate product surface (not in this SDK package)
+- **Docs** — What's New 0.5, Observability screenshots, provider-isolated project layout
 
 ### Compatibility
 
-- Graph is **optional** and **additive**. Omitting `graph` leaves 0.4 behavior unchanged.
-- No required constructor changes for upgrades from **0.4.x**.
-- Raw Cypher `query()` is Neo4j-only; SQLite graph hard-errors (use typed methods for portable code).
+- Graph was optional and additive in 0.5.0; it has since been removed from the SDK.
 
 ## [0.4.0] — 2026-07-18
 
@@ -122,7 +149,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 - **Memory upsert / dedupe** — opt-in write-time exact and near-duplicate detection updates existing active memories instead of inserting (`memory.dedupe`); `RememberResult.action`; history event `"updated"`; public `update()`
 - **Schema v3** — `content_hash` column, unique active hash index, `embedding_cache` table, history CHECK allows `'updated'`
 - **Docs** — Concurrency, Real-time events, Embedding cache, Memory upsert pages
-- **Benchmarks** — `benchmark/multiprocess-levels.ts`, `benchmark/embedding-cache-bench.ts`
 
 ### Changed
 
@@ -150,7 +176,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ### Added
 
-- **Telemetry system** — independent EventDatabase (never shares tables with memory). SQLite provider first; interface-ready for PostgreSQL.
+- **Telemetry system** — independent EventDatabase (never shares tables with memory). SQLite provider first; interface-ready for PostgreSQL (Postgres telemetry still not implemented).
 - **`wolbarg()` factory** plus `database.url` / `telemetry` configuration (additive; `storage` + `init()` still work)
 - **Trace system** — `session_id`, `trace_id`, `parent_trace_id` for waterfall debugging
 - **Telemetry schema v2** — additive organization, agent, tags, checkpoint, recall-explain, and stage-span fields with indexed queries and automatic v1 migration
@@ -159,8 +185,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 - **Import / export** — portable SQLite + manifest bundles
 - **Batch APIs** — `rememberBatch`, `recallBatch` with parent + child telemetry traces
 - **Actionable errors** — operation-scoped messages with reason + suggestion
-- **Internal benchmark helpers** — `runBenchmark` / `summarizeBenchmark`
-- **Wolbarg Studio** — separate Next.js app that reads telemetry databases (see `/wolbarg_studio`)
+- **Internal benchmark helpers** — `runBenchmark` / `summarizeBenchmark` (stopwatch utilities, not a product stress suite)
+- **Wolbarg Studio** — separate Next.js app that reads telemetry databases
 
 ### Changed
 
@@ -202,7 +228,7 @@ const ctx = wolbarg({
 ### Fixed
 
 - **SQLite production hardening** — WAL-safe pragmas, prepared statements, crash-safe batch inserts, and FTS5 kept in the same ACID transaction as semantic writes
-- **PostgreSQL production hardening** — named prepared statements, concurrent insert coalescing / unnest batches, COPY for large ingest, org-scoped ANN with adaptive overfetch, deferred HNSW build
+- **PostgreSQL production hardening** — named prepared statements, concurrent insert coalescing / unnest batches, org-scoped ANN with adaptive overfetch, deferred HNSW build
 - **FTS correctness** — archived memories removed from FTS so hybrid/keyword search never returns archived rows; rebuild path when FTS diverges
 - **Multi-tenant isolation** — organization filters enforced on ANN / HNSW query paths so tenants cannot leak across shared Postgres instances
 - **HNSW lifecycle** — index created lazily before first KNN (keeps bulk inserts fast); soft org reset does not drop unrelated indexes incorrectly
@@ -212,13 +238,11 @@ const ctx = wolbarg({
 ### Improved
 
 - **Performance** — batched transactions (SQLite), insert coalescing (Postgres), adaptive overfetch for filtered ANN
-- **Benchmark suite** — dual-backend mock stress + separate LIVE spot suite; clearer methodology separating storage latency from embedding-provider latency
-- **Docs / website** — v0.2.1 release notes, dual-backend benchmark page with SQLite and PostgreSQL sections
+- **Docs / website** — v0.2.1 release notes
 
 ### Notes
 
-- Storage benchmarks use mock embeddings to isolate SDK + database performance
-- LIVE spot benchmarks use real embedding providers for end-to-end latency — these are separate suites; do not mix the numbers
+- Storage benchmarks historically used mock embeddings to isolate SDK + database performance
 - Node.js **22.5+** still required
 
 ## [0.2.0] — 2026-07-14
@@ -231,7 +255,6 @@ const ctx = wolbarg({
 - Hybrid recall (semantic + BM25), metadata filters (`meta.*`), MMR, pluggable rerankers
 - Pluggable chunking strategies and optional vision / OCR providers
 - Website docs for v0.2 including Limitations and What’s New
-- Dual-backend (SQLite + Postgres) test harness
 
 ### Changed
 
@@ -254,6 +277,11 @@ const ctx = wolbarg({
 
 - Initial npm release path (pre–modular storage / ingest)
 
+[0.6.0]: https://github.com/wolbarg/wolbarg/releases/tag/v0.6.0
+[0.5.6]: https://github.com/wolbarg/wolbarg/releases/tag/v0.5.6
+[0.5.5]: https://github.com/wolbarg/wolbarg/releases/tag/v0.5.5
+[0.5.3]: https://github.com/wolbarg/wolbarg/releases/tag/v0.5.3
+[0.5.2]: https://github.com/wolbarg/wolbarg/releases/tag/v0.5.2
 [0.5.1]: https://github.com/wolbarg/wolbarg/releases/tag/v0.5.1
 [0.5.0]: https://github.com/wolbarg/wolbarg/releases/tag/v0.5.0
 [0.4.0]: https://github.com/wolbarg/wolbarg/releases/tag/v0.4.0
@@ -262,4 +290,3 @@ const ctx = wolbarg({
 [0.3.0]: https://github.com/wolbarg/wolbarg/releases/tag/v0.3.0
 [0.2.1]: https://github.com/wolbarg/wolbarg/releases/tag/v0.2.1
 [0.2.0]: https://github.com/wolbarg/wolbarg/releases/tag/v0.2.0
-[0.1.1]: https://www.npmjs.com/package/wolbarg/v/0.1.1

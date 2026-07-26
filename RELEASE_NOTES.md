@@ -1,58 +1,77 @@
-# Wolbarg 0.2.1
+# Wolbarg 0.6.0
 
-**Production hardening for SQLite and PostgreSQL.** Same API as 0.2.0 — safer transactions, correct FTS and multi-tenant isolation, and faster filtered recall.
+**Production-hardening release** for shared semantic memory. Same core loop — `remember()` / `recall()` — with safer concurrency, fail-closed retrieval, multi-tenant isolation, and Postgres defaults that match real deployments.
 
 ```bash
-npm install wolbarg@0.2.1
+npm install wolbarg@0.6.0
 ```
 
-Numbers: [wolbarg.com/benchmarks](https://wolbarg.com/benchmarks)
+Full changelog: [CHANGELOG.md](./CHANGELOG.md) · Architecture: [docs/architecture.md](./docs/architecture.md)
 
 ---
 
-## SQLite
+## Highlights
 
-WAL-safe pragmas, prepared statements, and crash-safe batch inserts. FTS5 updates run in the same ACID transaction as semantic writes, so hybrid search stays consistent after partial failures. Blob vector-index init and overfetch paths are fixed for correct recall.
+### Fail-closed retrieval
 
-## PostgreSQL
+`hybrid: true` and `rerank: true` no longer silently degrade. Missing providers throw `ValidationError`. Built-in HTTP/OpenAI rerankers throw `RerankError` instead of falling back to identity order. Incorrect ranking that looks successful is worse than a loud error.
 
-Named prepared statements, concurrent insert coalescing / `unnest` batches, and `COPY` for large ingest. Org-scoped ANN with adaptive overfetch. HNSW is built lazily before the first KNN — bulk inserts stay fast until you need approximate search.
+### Concurrent writers
 
-## Performance
+SQLite: WAL, `BEGIN IMMEDIATE`, insert coalescing, busy retries, cold-open busy retries, write-mutex savepoints. Postgres: pool default max **20**, insert coalescing, `SELECT … FOR UPDATE` on update/archive, deadlock/serialization retries, session statement/lock timeouts, `row_version` CAS.
 
-Batched SQLite transactions, coalesced Postgres inserts, and adaptive overfetch on filtered ANN cut storage-path latency without changing the public API. Benchmarks separate mock (SDK + DB) stress from LIVE embedding-provider spots — see the methodology on the [benchmarks page](https://wolbarg.com/benchmarks).
+### Postgres for shared databases
 
-## Correctness
+- Non-loopback URLs without `sslmode` get **`sslmode=require`** by default (`ssl: false` to opt out for local-only tunnels).
+- `schema: "wolbarg"` namespaces tables, indexes, and NOTIFY channels so one database can host independent deployments — including different embedding dimensions.
 
-### FTS
+### Multi-tenant safety
 
-Archived memories are removed from FTS so hybrid / keyword search never returns archived rows. When FTS diverges from the primary store, a rebuild path restores alignment.
+SQLite `export` / `import` / `checkpoint` / `rollback` refuse files that contain another organization’s memories. `subscribe()` cannot override `organization` to another tenant. Open warns when a shared multi-org SQLite file is detected.
 
-### Multi-tenant isolation
+### Cancellation
 
-Organization filters are enforced on ANN / HNSW query paths. Tenants cannot leak across shared Postgres instances.
+Pass `signal: AbortSignal` (or `AbortSignal.timeout(ms)`) on `remember` / `recall` / `update` / `compress` / `forget`. Throws `CancellationError`; in-flight embedding HTTP aborts.
 
-### HNSW lifecycle
+### Removed: graph memory
 
-Indexes are created lazily before the first KNN. Soft org reset no longer drops unrelated indexes.
+`sqliteGraph` / `neo4jGraph`, `linkMemories` / `getRelated`, and `includeGraph` are gone. Model relationships with metadata or an external store. Upgrade code that imported graph APIs before installing 0.6.0.
 
-### Compression
+---
 
-Active-set reduction and archive bookkeeping stay aligned with recall filters, so compressed history does not reappear incorrectly in search.
+## Upgrade notes
+
+| Area | Action |
+| --- | --- |
+| Graph APIs | Remove `graph`, `linkMemories`, `getRelated`, `includeGraph` usage |
+| Hybrid / rerank | Ensure `keywordSearch` / `reranker` are configured when flags are set |
+| Postgres remote | Expect TLS (`sslmode=require`) unless you override |
+| Pool size | Raise `maxPoolSize` if you relied on the old default of 64 |
+| Telemetry | Set `captureQueries: true` if you need query strings persisted |
+| Rerank errors | Catch `RerankError` instead of assuming soft fallback |
+
+From 0.5.x without graph:
+
+```bash
+npm install wolbarg@0.6.0
+```
+
+Most `remember` / `recall` call sites need no changes. Review hybrid, rerank, and Postgres SSL settings.
 
 ---
 
 ## Requirements
 
-- Node.js **22.5+**
-- SQLite (built-in) or PostgreSQL with optional pgvector
+- Node.js **22.5+** (`node:sqlite`)
+- SQLite (built-in) or PostgreSQL with optional pgvector (`pg` peer)
+- Any OpenAI-compatible embedding endpoint
 
-## Upgrade
+## What this release does not claim
 
-Drop-in for 0.2.0. No schema migration beyond what 0.2.0 already shipped.
+- Postgres telemetry store (not implemented)
+- Multi-process SQLite `subscribe()`
+- Checked-in public benchmark reproduction in this repository
+- Graph memory / Neo4j (removed)
+- Application-layer auth — `organization` is a data namespace, not IAM
 
-```bash
-npm install wolbarg@0.2.1
-```
-
-Full changelog: [CHANGELOG.md](./CHANGELOG.md)
+See [docs/production.md](./docs/production.md) for operator guidance.
